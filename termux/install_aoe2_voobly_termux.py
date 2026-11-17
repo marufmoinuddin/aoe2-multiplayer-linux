@@ -107,7 +107,8 @@ ld-linux-x86-64.so.2 crashhandler.so libtcmalloc_minimal.so.0 libtcmalloc_minima
 # Host-side (glibc, AArch64) packages that Box64's wrappers dlopen. Names are
 # discovered from the repo at run time, so naming differences do not matter.
 GLIBC_LIB_PATTERN = re.compile(
-    r'^(libx|xcb|libxcb|libxkb|libpulse|pulseaudio|alsa|libdrm|libglvnd|mesa|virglrenderer|libepoxy|xorg)')
+    r'^(libx|xcb|libxcb|libxkb|libpulse|pulseaudio|alsa|libdrm|libglvnd|mesa|virglrenderer|libepoxy|xorg'
+    r'|(?:lib)?(?:gnutls|p11-kit|libtasn1|nettle|hogweed|cups)(?:$|-))')
 GLIBC_CRITICAL = ('libX11.so.6', 'libxcb.so.1')
 
 TOTAL_STAGES = 8
@@ -528,13 +529,17 @@ X_SOCKET="$TERMUX_PREFIX/tmp/.X11-unix/X0"
 
 aoe2_session_start() {
     command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock || true
-    if ! pgrep -f 'termux.x11' >/dev/null 2>&1; then
-        nohup termux-x11 :0 -ac >/dev/null 2>&1 &
-    fi
     local i
-    for i in $(seq 1 40); do [[ -S "$X_SOCKET" ]] && break; sleep 0.5; done
-    [[ -S "$X_SOCKET" ]] || echo 'Termux:X11 did not start; is the Termux:X11 app installed?' >&2
+    export TMPDIR="$TERMUX_PREFIX/tmp"
+    if [[ ! -S "$X_SOCKET" ]]; then
+        nohup termux-x11 :0 -ac >"${BASH_SOURCE[0]%/*}/termux-x11.log" 2>&1 &
+    fi
     am start --user 0 -n com.termux.x11/com.termux.x11.MainActivity >/dev/null 2>&1 || true
+    for ((i=0; i<40; i++)); do [[ -S "$X_SOCKET" ]] && break; sleep 0.5; done
+    if [[ ! -S "$X_SOCKET" ]]; then
+        echo "Termux:X11 did not create $X_SOCKET. Install the companion APK matching termux-x11-nightly, open it, and retry. Server log: ${BASH_SOURCE[0]%/*}/termux-x11.log" >&2
+        return 1
+    fi
     export DISPLAY=:0 PULSE_SERVER=tcp:127.0.0.1
     pgrep -x pulseaudio >/dev/null 2>&1 \
         || pulseaudio --start --exit-idle-time=-1 >/dev/null 2>&1 || true
@@ -560,7 +565,7 @@ def install_session():
 def start_session():
     session = install_session()
     run([BASH, '-c', f'AOE2_RENDERER={shlex.quote(RENDERER)}; . {shlex.quote(str(session))}; aoe2_session_start'],
-        timeout=120, check=False)
+        timeout=120)
 
 
 # -------------------------------------------------------------- emulator ----
@@ -934,7 +939,12 @@ def install_wrappers(runner, prefix=None):
     if not EMU_CMD: raise RuntimeError('No emulator configured for the wrappers.')
     bin_dir = DATA / 'bin'
     bin_dir.mkdir(parents=True, exist_ok=True)
-    env_items = [f'{k}={v}' for k, v in EMU_ENV.items()]
+    # Box64 needs the native AArch64 glibc libraries for its dlopen wrappers.
+    # Keep these separate from the guest x86_64 BOX64_LD_LIBRARY_PATH.
+    host_env = dict(EMU_ENV)
+    if ROUTE == 'box64':
+        host_env.setdefault('LD_LIBRARY_PATH', str(GLIBC_LIB))
+    env_items = [f'{k}={v}' for k, v in host_env.items()]
     replacements = {
         '@BASH@': str(BASH), '@RUNNER_Q@': shlex.quote(str(runner)), '@BIN_Q@': shlex.quote(str(bin_dir)),
         '@ROUTE_Q@': shlex.quote(ROUTE), '@ARCH_Q@': shlex.quote(PREFIX_ARCH),
@@ -1057,8 +1067,18 @@ def create_prefix(wine, prefix, state, save):
                                + ', '.join(foreign))
     prefix.mkdir(parents=True, exist_ok=True)
     if fresh:
-        run([wine, 'wineboot', '--init'], env=wine_env(prefix), timeout=900)
-        state['prefix_created'] = True; save()
+        init_env = wine_env(prefix, {'WINEDEBUG': '-all,err+all'})
+        rc, output = run([wine, 'wineboot', '--init'], env=init_env, timeout=900, check=False)
+        # wineboot can exit before wineserver flushes system.reg. Wait for the
+        # prefix's server to finish, then verify the registry even on exit 0.
+        if rc == 0 and prefix_arch(prefix) is None:
+            run([DATA / 'bin' / 'wineserver', '-w'], env=init_env, timeout=60, check=False)
+        if rc or prefix_arch(prefix) is None:
+            errors = [line for line in output.splitlines() if any(
+                word in line for word in ('RegInstallA', '__chk_fail', 'nodrv_CreateWindow', 'wineserver:'))]
+            detail = '\n'.join(dict.fromkeys(errors)) or output[-2000:]
+            raise RuntimeError(f'Wine prefix initialization failed (wineboot exit {rc}, prefix: {prefix}). '
+                               f'No prefix files were removed. Full log: {LOG}\n{detail}')
     arch = prefix_arch(prefix)
     if arch != PREFIX_ARCH:
         raise RuntimeError(f'Expected {PREFIX_ARCH} prefix, found {arch!r}; no conversion is attempted.')
@@ -1077,6 +1097,8 @@ def create_prefix(wine, prefix, state, save):
         run([wine, 'reg', 'add', key, '/v', 'renderer', '/d', 'gdi', '/f'], env=wine_env(prefix))
     else:
         run([wine, 'reg', 'delete', key, '/v', 'renderer', '/f'], env=wine_env(prefix), check=False)
+    if fresh or not state.get('prefix_created'):
+        state['prefix_created'] = True; save()
     say('32-bit Windows cmd.exe executed successfully.', '32')
 
 
@@ -1333,7 +1355,7 @@ export AOE2_RENDERER="$RENDERER"
 mkdir -p "$BASE/logs"
 # shellcheck disable=SC1091
 . "$BASE/tools/session.sh"
-aoe2_session_start
+aoe2_session_start || exit 1
 # Locks are per shared game directory, not per prefix.
 LOCKFILE=@LOCK_Q@
 mkdir -p "$(dirname "$LOCKFILE")"
