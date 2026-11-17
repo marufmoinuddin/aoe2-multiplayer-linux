@@ -32,6 +32,7 @@ import datetime as dt
 import fcntl
 import gzip
 import hashlib
+import io
 import json
 import logging
 import lzma
@@ -41,6 +42,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import struct
 import subprocess as sp
 import sys
@@ -496,13 +498,21 @@ def install_termux_packages():
 
 def tools():
     need = {'cabextract': 'cabextract', 'unzip': 'unzip', 'curl': 'curl', 'sha256sum': 'coreutils',
-            'flock': 'util-linux', 'file': 'file', 'awk': 'gawk', 'bsdtar': 'libarchive',
+            'flock': 'util-linux', 'file': 'file', 'awk': 'gawk',
             'xz': 'xz-utils', 'tar': 'tar', 'grep': 'grep', 'sed': 'sed', 'ps': 'procps', 'timeout': 'coreutils'}
     missing = [c for c in need if not shutil.which(c)]
     if missing:
         pkg_install(sorted({need[c] for c in missing}))
     missing = [c for c in need if not shutil.which(c)]
     if missing: raise RuntimeError('Commands still unavailable: ' + ', '.join(missing))
+    # RPMs are unpacked by bsdtar when available. Newer Termux splits bsdtar out of
+    # libarchive, so try both names; without either, extract_rpm falls back to its
+    # built-in reader (zstd is installed above).
+    for package in ('bsdtar', 'libarchive'):
+        if shutil.which('bsdtar'): break
+        pkg_install([package])
+    if not shutil.which('bsdtar'):
+        logging.info('bsdtar unavailable; using the built-in RPM payload extractor.')
 
 
 # -------------------------------------------------- display / audio session -
@@ -586,12 +596,18 @@ def probe_emulator(emu):
 
 
 # ------------------------------------------------- emulated x86_64 libraries -
+def x64_libdirs():
+    """Where RPM payloads put 64-bit libraries: most packages use usr/lib64,
+    libgcc uses lib64 (the merged-/usr symlink target on Fedora/RHEL)."""
+    return [X64LIBS / 'usr/lib64', X64LIBS / 'lib64']
+
+
 def x64_libdir():
-    return X64LIBS / 'usr/lib64'
+    return x64_libdirs()[0]
 
 
 def x64_lib_present(name):
-    dirs = [x64_libdir()] + [Path(p) for p in os.environ.get('AOE2_X64LIB_DIRS', '').split(':') if p]
+    dirs = x64_libdirs() + [Path(p) for p in os.environ.get('AOE2_X64LIB_DIRS', '').split(':') if p]
     for d in dirs:
         p = d / name
         try:
@@ -603,17 +619,18 @@ def x64_lib_present(name):
 
 def x64_lib_files():
     seen, files = set(), []
-    for p in x64_libdir().rglob('*.so*') if x64_libdir().is_dir() else ():
-        try: real = p.resolve()
-        except (OSError, RuntimeError): continue
-        if real.is_file() and real not in seen:
-            seen.add(real); files.append(real)
+    for d in x64_libdirs():
+        for p in d.rglob('*.so*') if d.is_dir() else ():
+            try: real = p.resolve()
+            except (OSError, RuntimeError): continue
+            if real.is_file() and real not in seen:
+                seen.add(real); files.append(real)
     return files
 
 
 def box64_ld_library_path(runner=None):
     if ROUTE != 'box64': return ''
-    parts = [str(x64_libdir())]
+    parts = [str(d) for d in x64_libdirs()]
     unix = (runner or runner_path()) / 'lib/wine/x86_64-unix'
     if unix.is_dir(): parts.append(str(unix))
     return ':'.join(parts)
@@ -684,14 +701,103 @@ def repo_index():
     return index
 
 
-def extract_rpm(rpm, dest):
-    Path(dest).mkdir(parents=True, exist_ok=True)
-    if shutil.which('bsdtar'):
-        run(['bsdtar', '-xf', rpm, '-C', dest], timeout=300)
-    elif shutil.which('rpm2cpio') and shutil.which('cpio'):
-        run(['bash', '-c', 'cd "$1" && rpm2cpio "$2" | cpio -idm --quiet', 'x', str(dest), str(rpm)], timeout=300)
+RPM_MAGIC = b'\xed\xab\xee\xdb'
+CPIO_MAGIC = (b'070701', b'070702')
+
+
+def rpm_payload_bytes(path):
+    """Decompress the cpio payload of an RPM without external tools."""
+    with Path(path).open('rb') as fh:
+        if fh.read(4) != RPM_MAGIC:
+            raise RuntimeError(f'Not an RPM package: {Path(path).name}')
+
+        def header_end(offset):
+            fh.seek(offset)
+            head = fh.read(16)
+            if len(head) < 16 or head[:3] != b'\x8e\xad\xe8':
+                raise RuntimeError(f'Corrupt RPM header in {Path(path).name}')
+            nindex, hsize = struct.unpack('>II', head[8:16])
+            return offset + 16 + nindex * 16 + hsize
+
+        payload = header_end((header_end(96) + 7) & ~7)   # signature header is padded to 8 bytes
+        fh.seek(payload)
+        blob = fh.read()
+    if blob.startswith(b'\xfd7zXZ'):
+        data = lzma.decompress(blob)
+    elif blob.startswith(b'\x1f\x8b'):
+        data = gzip.decompress(blob)
+    elif blob.startswith(b'BZh'):
+        data = bz2.decompress(blob)
+    elif blob.startswith(b'\x28\xb5\x2f\xfd'):
+        if not shutil.which('zstd'): raise RuntimeError('zstd is required: pkg install zstd')
+        logging.info('RUN zstd -dc < %s', path)
+        proc = sp.run(['zstd', '-dc'], input=blob, stdout=sp.PIPE, stderr=sp.PIPE)
+        if proc.returncode:
+            raise RuntimeError(f'zstd failed on {Path(path).name}: '
+                               + proc.stderr.decode('utf-8', 'replace')[-500:])
+        data = proc.stdout
     else:
-        raise RuntimeError('Need bsdtar to unpack RPMs: pkg install libarchive')
+        raise RuntimeError(f'Unknown RPM payload compression in {Path(path).name}')
+    if len(data) > 512 * 1024 ** 2:
+        raise RuntimeError(f'RPM payload too large: {Path(path).name}')
+    return data
+
+
+def extract_cpio(blob, dest):
+    """Extract a cpio newc/crc payload (the RPM payload format) into dest."""
+    root = Path(dest)
+    root.mkdir(parents=True, exist_ok=True)
+    stream, links = io.BytesIO(blob), {}
+    while True:
+        hdr = stream.read(110)
+        if len(hdr) < 110: break
+        if hdr[:6] not in CPIO_MAGIC:
+            raise RuntimeError(f'Unsupported RPM payload (cpio magic {hdr[:6]!r}).')
+        values = [int(hdr[6 + 8 * i:14 + 8 * i], 16) for i in range(13)]
+        ino, mode, nlink, filesize, namesize = values[0], values[1], values[4], values[6], values[11]
+        name = stream.read(namesize).split(b'\0', 1)[0].decode('utf-8', 'surrogateescape')
+        stream.read(-(110 + namesize) % 4)
+        if name == 'TRAILER!!!': break
+        data = stream.read(filesize) if filesize else b''
+        stream.read(-filesize % 4)
+        parts = [p for p in name.split('/') if p not in ('', '.')]
+        if not parts or '..' in parts: continue
+        target = root.joinpath(*parts)
+        try:
+            if stat.S_ISDIR(mode):
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if stat.S_ISLNK(mode):
+                if target.is_symlink() or target.exists(): target.unlink()
+                os.symlink(data.decode('utf-8', 'surrogateescape'), target)
+            elif stat.S_ISREG(mode):
+                key = (values[7], values[8], ino)      # devmajor, devminor, ino
+                if nlink > 1 and not data and key in links:
+                    if target.exists() or target.is_symlink(): target.unlink()
+                    os.link(links[key], target)
+                else:
+                    links[key] = target
+                    target.write_bytes(data)
+                    os.chmod(target, mode & 0o777)
+        except OSError as exc:
+            logging.warning('Skipping %s from RPM payload: %s', name, exc)
+
+
+def extract_rpm(rpm, dest):
+    """Unpack an RPM payload into dest: bsdtar, rpm2cpio, or the built-in reader."""
+    Path(dest).mkdir(parents=True, exist_ok=True)
+    attempts = []
+    if shutil.which('bsdtar'):
+        attempts.append(['bsdtar', '-xf', str(rpm), '-C', str(dest)])
+    if shutil.which('rpm2cpio') and shutil.which('cpio'):
+        attempts.append(['bash', '-c', 'cd "$1" && rpm2cpio "$2" | cpio -idm --quiet',
+                         'x', str(dest), str(rpm)])
+    for argv in attempts:
+        rc, text = run(argv, timeout=300, check=False)
+        if rc == 0: return
+        logging.warning('Could not unpack %s with %s:\n%s', Path(rpm).name, argv[0], text[-800:])
+    extract_cpio(rpm_payload_bytes(rpm), dest)
 
 
 def ensure_x64_libs(runner):
@@ -724,7 +830,7 @@ def ensure_x64_libs(runner):
     if soft:
         say('Optional x86_64 libraries unavailable (fonts/TLS may be degraded): ' + ', '.join(soft), '33')
     if fetched:
-        say(f'x86_64 libraries ready in {x64_libdir()} ({len(fetched)} package(s)).', '32')
+        say(f'x86_64 libraries ready in {X64LIBS} ({len(fetched)} package(s)).', '32')
     else:
         say('x86_64 libraries already available.', '32')
 
@@ -1532,7 +1638,7 @@ def main():
         'host': f'android/{platform.machine().lower()} (Termux native, no proot)',
         'wine_version': version, 'wine_binary': str(runner / 'bin/wine'), 'wine_wrapper': str(wine),
         'execution': f'{ROUTE} ({" ".join(EMU_CMD)})', 'wine_archive_sha256': WINE_SHA256,
-        'x86_64_libraries': str(x64_libdir()), 'renderer': RENDERER,
+        'x86_64_libraries': str(X64LIBS), 'renderer': RENDERER,
         'prefix': str(prefix), 'prefix_architecture': prefix_arch(prefix),
         'original_game': str(source), 'game_drive': f'{drive} (original directory, not a copy)',
         'conquerors_executable': game_win, 'voobly_z_path': z_path, 'voobly': str(voobly),
