@@ -899,7 +899,7 @@ unset WINE_DISABLE_FULLSCREEN_HACK STAGING_WRITECOPY
 export WINE="$BIN/wine" WINESERVER="$BIN/wineserver"
 export WINEPREFIX="${WINEPREFIX:-$PREFIX_DEFAULT}"
 export WINEARCH="$PREFIX_ARCH"
-export PATH="$BIN:$RUNNER/bin:$PATH"
+export PATH="$BASE/tools/native-bin:$BIN:$RUNNER/bin:$PATH"
 export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-winemenubuilder.exe=d}"
 export DISPLAY="${DISPLAY:-:0}"
 export PULSE_SERVER="${PULSE_SERVER:-tcp:127.0.0.1}"
@@ -949,6 +949,10 @@ def install_wrappers(runner, prefix=None):
     if ROUTE == 'box64':
         host_env.setdefault('LD_LIBRARY_PATH', str(GLIBC_LIB))
     env_items = [f'{k}={v}' for k, v in host_env.items()]
+    # Strip glibc variables before the bionic lscpu is loaded.
+    bridge = ('#!' + str(TERMUX / 'bin/env') + ' -S -u LD_LIBRARY_PATH -u LD_PRELOAD '
+              + str(BASH) + '\nexec ' + shlex.quote(str(TERMUX / 'bin/lscpu')) + ' "$@"\n')
+    atomic(DATA / 'tools/native-bin/lscpu', bridge, 0o755)
     replacements = {
         '@BASH@': str(BASH), '@RUNNER_Q@': shlex.quote(str(runner)), '@BIN_Q@': shlex.quote(str(bin_dir)),
         '@ROUTE_Q@': shlex.quote(ROUTE), '@ARCH_Q@': shlex.quote(PREFIX_ARCH),
@@ -1284,6 +1288,23 @@ def seed_directplay_redist():
     return False
 
 
+def register_directplay(wine, prefix):
+    names = ('dplayx.dll', 'dpnet.dll', 'dpnhpast.dll', 'dpnhupnp.dll')
+    env = wine_env(prefix, {'WINEDLLOVERRIDES':
+        'winemenubuilder.exe=d;dplayx,dpnet,dpnhpast,dpnhupnp,dpwsockx,dpmodemx=n',
+        'WINEDEBUG': '-all,err+all,+loaddll,+ole'})
+    for name in names:
+        dll = windows32_dir(prefix) / name
+        if pe_machine(dll) != 0x14c:
+            raise RuntimeError(f'Missing or non-i386 DirectPlay DLL: {dll}')
+        command = [wine, str(windows32_dir(prefix) / 'regsvr32.exe'), '/s', str(dll)]
+        rc, output = run(command, env=env, timeout=180, check=False)
+        if rc:
+            raise RuntimeError(f'DirectPlay registration failed for {name} (exit {rc}). '
+                               'Verified downloads and prefix are preserved; do not download the redist again. '
+                               f'Loader/COM diagnostics: {LOG}\n' + output[-4500:])
+
+
 def install_components(wine, prefix, state, save):
     directory = windows32_dir(prefix)
     wt = install_winetricks()
@@ -1306,19 +1327,13 @@ def install_components(wine, prefix, state, save):
         if not seed_directplay_redist():
             say('  DirectX redist could not be pre-fetched; winetricks will try archive.org itself '
                 '(this often 503s).', '33')
-        last = ''
-        for attempt in range(1, 4):
-            rc, text = run([BASH, wt, '-q', 'directplay'], env=env, timeout=3600, check=False)
-            if rc == 0: break
-            last = text[-1500:]
-            if attempt < 3:
-                say(f'  winetricks attempt {attempt}/3 failed; retrying in {5 * attempt}s', '33')
-                time.sleep(5 * attempt)
-        else:
-            raise RuntimeError('winetricks directplay failed after 3 attempts. Download\n'
-                               f'  {DIRECTX_REDIST_NAME}\n(SHA256 {DIRECTX_REDIST_SHA256}) into\n'
-                               f'  {winetricks_cache_dirs()[0] / "directx9"}\n'
-                               'and rerun, or retry later when archive.org is reachable.\n' + last)
+        rc, text = run([BASH, wt, '-q', 'directplay'], env=env, timeout=3600, check=False)
+        if rc:
+            if 'regsvr32' not in text or not any(x in text for x in ('Failed to register', 'returned status')):
+                raise RuntimeError(f'DirectPlay installation failed; cached downloads kept. Log: {LOG}\n' + text[-3500:])
+            say('Retrying extracted DirectPlay registration with explicit native overrides.', '33')
+    # Always validate registration, including prefixes left by failed attempts.
+    register_directplay(wine, prefix)
     missing = [n for n in DIRECTPLAY_FILES if not (directory / n).is_file() or pe_machine(directory / n) != 0x14c]
     if missing or not directplay_registered(wine, prefix):
         raise RuntimeError(f'32-bit DirectPlay verification failed in {directory}; files={missing}')
