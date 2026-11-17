@@ -1183,10 +1183,21 @@ if command -v flock >/dev/null 2>&1; then
 fi
 HELPER="$BASE/tools/clear-directplay-conflict.sh"
 if [[ -x "$HELPER" ]]; then
-    "$HELPER" --check || {
-        echo "Inspect/close existing games first. For confirmed stale helpers run: $HELPER" >&2
-        exit 1
-    }
+    if ! "$HELPER" --check; then
+        # A confirmed leftover helper for this prefix is the common case after a
+        # closed game; offer to clear it instead of refusing to launch at all.
+        if [[ -t 0 ]]; then
+            printf 'Stop the confirmed leftover DirectPlay helper(s) for this prefix and continue? [y/N] '
+            read -r answer
+            case "$answer" in
+                y|Y|yes|YES) "$HELPER" interactive || { echo "Port 47624 is still occupied." >&2; exit 1; } ;;
+                *) echo "Aborted. Inspect with: $HELPER" >&2; exit 1 ;;
+            esac
+        else
+            echo "Inspect/close existing games first. For confirmed stale helpers run: $HELPER" >&2
+            exit 1
+        fi
+    fi
 fi
 ensure_drive() {
     local letter link

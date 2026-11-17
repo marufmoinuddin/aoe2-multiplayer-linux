@@ -159,6 +159,12 @@ Never kill *every* `dplaysvr.exe`, and don't change DirectPlay settings repeated
 
 **Wayland-only session.** Wine may need a working XWayland, or its Wayland driver configured.
 
+**Launcher says port 47624 is occupied.** A closed game can leave its
+`dplaysvr.exe` helper running. The launcher now shows the owners and offers to
+stop the confirmed leftover for this prefix (`y`). It never kills a helper while
+a game or Voobly client is running; in that case close them first. To inspect
+manually: `~/.local/share/aoe2-multiplayer-linux/tools/clear-directplay-conflict.sh`.
+
 **DirectPlay install fails with an archive.org error.** Winetricks fetches the
 Feb 2010 DirectX redist from a single web.archive.org snapshot that often returns
 503/404. The installer pre-seeds that file from mirrors (same SHA256 as
