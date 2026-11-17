@@ -6,6 +6,23 @@ It works on both **x86_64** (native) and **ARM64**. On ARM64 you choose the emul
 
 > Use only with game files and installers you trust and are licensed to use. Wine is **not** a security sandbox.
 
+## Quick install
+
+**Linux** (any distro; no clone needed):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/marufmoinuddin/aoe2-multiplayer-linux/main/install_aoe2_voobly.py | python3
+```
+
+**Android / Termux** (after installing the [Termux:X11](https://github.com/termux/termux-x11/releases) app):
+
+```bash
+pkg install -y curl && curl -fsSL https://raw.githubusercontent.com/marufmoinuddin/aoe2-multiplayer-linux/main/termux/install-aoe2-voobly.sh | bash
+```
+
+Both are interactive and resumable; prompts work even though the script arrives via a pipe.
+More options (verbose mode, emulator route, GPU mode, DirectDraw renderer) are below.
+
 ## What it does
 
 The installer walks you through 8 stages:
@@ -40,11 +57,9 @@ Local checkout:
 ./install_aoe2_voobly.py --verbose  # also print every command and its output
 ```
 
-Direct from GitHub (no clone needed):
+Direct from GitHub (see **Quick install** above) with options:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/marufmoinuddin/aoe2-multiplayer-linux/main/install_aoe2_voobly.py | python3
-# with options:
 curl -fsSL https://raw.githubusercontent.com/marufmoinuddin/aoe2-multiplayer-linux/main/install_aoe2_voobly.py | python3 - --route box64 --verbose
 ```
 
@@ -91,11 +106,10 @@ Your original game directory and system Wine installation are never replaced.
 An Android port lives in [termux/](termux/) — a Bash installer for Termux +
 Termux:X11 that keeps the same architecture (Wine 10.0 amd64-wow64, one shared
 `win64` prefix, Winetricks DirectPlay, Voobly, `play-*` launchers) inside a
-proot-distro Ubuntu glibc container with Box64:
+proot-distro Ubuntu glibc container with Box64.
+Install it with the one-liner in **Quick install** above; passed options:
 
 ```bash
-pkg install -y curl && curl -fsSL https://raw.githubusercontent.com/marufmoinuddin/aoe2-multiplayer-linux/main/termux/install-aoe2-voobly.sh | bash
-# with options (GPU mode / DirectDraw renderer):
 pkg install -y curl && curl -fsSL https://raw.githubusercontent.com/marufmoinuddin/aoe2-multiplayer-linux/main/termux/install-aoe2-voobly.sh | bash -s -- --gpu=virgl --ddraw=cnc
 ```
 

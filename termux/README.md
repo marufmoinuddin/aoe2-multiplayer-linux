@@ -9,14 +9,6 @@ Only the Android-specific parts differ: Termux:X11 for the display, PulseAudio
 over TCP for sound, a glibc container (proot-distro Ubuntu) because Wine
 amd64-wow64 needs glibc, and Box64 invoked explicitly instead of via binfmt.
 
-## Requirements
-
-- Termux from F-Droid (Play Store builds are outdated)
-- [Termux:X11](https://github.com/termux/termux-x11/releases) APK installed
-- Android 8+, arm64-v8a device, ~4 GB free, no root
-- Your own classic AoE II (AoK + The Conquerors) files and the Voobly setup
-  executable, e.g. in `~/storage/shared/Games/Age of Empires II`
-
 ## Install
 
 One line, straight from GitHub (no clone needed):
@@ -49,6 +41,14 @@ Then launch from Termux: `play-aok`, `play-aoe2` or `play-voobly`
 (equivalently `aoe2-termux play-aoe2`). The launcher starts Termux:X11,
 PulseAudio and, in VirGL mode, the host GPU server, then runs the game inside
 the glibc container.
+
+## Requirements
+
+- Termux from F-Droid (Play Store builds are outdated)
+- [Termux:X11](https://github.com/termux/termux-x11/releases) APK installed
+- Android 8+, arm64-v8a device, ~4 GB free, no root
+- Your own classic AoE II (AoK + The Conquerors) files and the Voobly setup
+  executable, e.g. in `~/storage/shared/Games/Age of Empires II`
 
 ## What it does (same stages as the Linux installer)
 
