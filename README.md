@@ -63,6 +63,25 @@ Your original game directory and system Wine installation are never replaced.
 4. Room settings: **32-bit color, windowed mode, no virtual desktop**; the Conquerors launcher already passes `-nostartup`.
 5. Play a real two-player match, then back up the working prefix and game directory.
 
+## Uninstalling
+
+```bash
+./uninstall_aoe2_voobly.py                  # interactive
+./uninstall_aoe2_voobly.py --dry-run        # show what would be removed, delete nothing
+./uninstall_aoe2_voobly.py --purge-backups  # also remove the game directory backups
+```
+
+The uninstaller shows a full inventory (prefix, runner, launchers, desktop entries, icons, state, logs, caches, backups) with sizes and asks for confirmation before removing anything. It also offers to stop any running Wine processes belonging to the prefix first — it never kills them silently.
+
+**Removed:** everything the installer created, all of it under `~/.local/share/aoe2-voobly/`, `~/.cache/aoe2-voobly/`, plus the `aoe2-voobly-*` desktop entries and icons.
+
+**Never removed:**
+- your original game directory
+- the Voobly setup executable (and any `voobly.exe` outside the prefix)
+- system Wine, shared `~/.local/share/applications` and icon directories (only `aoe2-voobly-*` files are deleted)
+
+Game directory backups (`<game dir>.backup-<timestamp>`) are **kept by default** — confirm the extra prompt or pass `--purge-backups` to remove them. Re-running the installer afterwards starts from scratch.
+
 ## Troubleshooting
 
 **Multiplayer drops back to the connection screen.** A stale DirectPlay helper is likely holding port **47624**. The launchers clear it automatically before starting; to do it manually:
