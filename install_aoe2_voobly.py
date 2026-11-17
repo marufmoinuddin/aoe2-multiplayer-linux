@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
-"""AoE II Classic + Voobly installer for Linux (x86_64 native, ARM64 via FEX).
+"""AoE II Classic + Voobly installer: native x86, ARM64 FEX, or ARM64 Box64.
 
-Validated layout: Wine 10.0 x86 (32-bit only) driven through FEX on ARM64,
-a pure WINEARCH=win32 prefix, the existing game exposed through the first free
-Wine drive letter (Wine may already have claimed G: for a host mount), native
-DirectPlay from Winetricks, and runner-pinned launchers.
+Prebuilt only. ARM64 users select FEX + Wine 10.0 x86/win32 or
+Box64 + Wine 10.0 amd64-wow64/win64. Each route has separate state,
+runners, prefixes, wrappers and logs below XDG_DATA_HOME/aoe2-voobly/routes.
+No existing environment is migrated. Existing game files are shared read-write.
 
-Use only with game files and installers you trust and are licensed to use.
-Wine is not a security sandbox. State and logs are user-local.
+Package adapters: Debian/Ubuntu (apt), Fedora/RHEL family (dnf/yum),
+Arch family (pacman). Repository availability and native library support vary;
+missing prebuilt prerequisites cause an actionable stop, never a source build.
+FEX RootFS must be configured separately if not already available.
+
+Wine is not a sandbox. Use trusted licensed game files/installers.
+Backend runtime compatibility and real multiplayer require user smoke tests.
 """
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import fcntl
 import hashlib
@@ -32,10 +38,13 @@ import urllib.request
 from pathlib import Path
 
 HOME = Path.home()
-DATA = Path(os.environ.get('XDG_DATA_HOME', HOME / '.local/share')) / 'aoe2-voobly'
-CACHE = Path(os.environ.get('XDG_CACHE_HOME', HOME / '.cache')) / 'aoe2-voobly'
-APPS = DATA.parent / 'applications'
-ICONS = DATA.parent / 'icons/hicolor/256x256/apps'
+DATA_HOME = Path(os.environ.get('XDG_DATA_HOME', HOME / '.local/share')).expanduser().absolute()
+BASE_DATA = DATA_HOME / 'aoe2-voobly'
+DATA = BASE_DATA
+BASE_CACHE = Path(os.environ.get('XDG_CACHE_HOME', HOME / '.cache')).expanduser().absolute() / 'aoe2-voobly'
+CACHE = BASE_CACHE
+APPS = DATA_HOME / 'applications'
+ICONS = DATA_HOME / 'icons/hicolor/256x256/apps'
 COLOR = sys.stdout.isatty() and not os.environ.get('NO_COLOR')
 STAMP = dt.datetime.now().strftime('%Y%m%d-%H%M%S')
 LOG = DATA / 'logs' / (STAMP + '.log')
@@ -45,6 +54,10 @@ WINE_ARCHIVE = f'wine-{WINE_VERSION}-x86.tar.xz'
 WINE_SHA256 = 'c5be273749f5c513b3edf7ad79d8214be558b80c67c6ca343d2f17fdcc30c2d2'
 WINE_URL = f'https://github.com/Kron4ek/Wine-Builds/releases/download/{WINE_VERSION}/{WINE_ARCHIVE}'
 TOTAL_STAGES = 8
+ROUTE = 'native'
+PREFIX_ARCH = 'win32'
+EMULATOR = None
+OPTIONS = None
 DIRECTPLAY_FILES = ('dplayx.dll', 'dpnet.dll', 'dpnhpast.dll', 'dpwsockx.dll')
 
 
@@ -161,8 +174,9 @@ def pe_machine(path):
 
 def elf_machine(path):
     try:
-        b = Path(path).read_bytes()[:20]
-        if b[:4] != b'\x7fELF': return None
+        with Path(path).open('rb') as f:
+            b = f.read(20)
+        if len(b) < 20 or b[:4] != b'\x7fELF': return None
         return int.from_bytes(b[18:20], 'little' if b[5] == 1 else 'big')
     except OSError:
         return None
@@ -198,171 +212,304 @@ def prefix_arch(prefix):
     return m.group(1) if m else None
 
 
-def tools():
-    required = ['cabextract', 'unzip', 'wrestool', 'icotool', 'curl', 'sha256sum', 'sed', 'timeout']
-    missing = [x for x in required if not shutil.which(x)]
-    if not missing: return
-    say('Missing helper tools: ' + ', '.join(missing), '33')
-    if shutil.which('apt-get'):
-        cmd = ['apt-get', 'install', '-y', 'cabextract', 'unzip', 'icoutils']
-    elif shutil.which('dnf'):
-        cmd = ['dnf', 'install', '-y', 'cabextract', 'unzip', 'icoutils']
-    elif shutil.which('pacman'):
-        cmd = ['pacman', '-S', '--needed', '--noconfirm', 'cabextract', 'unzip', 'icoutils']
-    else:
-        raise RuntimeError('Install cabextract, unzip and icoutils with your package manager, then rerun.')
-    say(shlex.join(['sudo', *cmd]))
-    if not yes('Authorize installing these helper packages?'):
-        raise RuntimeError('Required helper installation declined.')
+def distro_family():
+    values = {}
+    try:
+        for line in Path('/etc/os-release').read_text().splitlines():
+            if '=' in line:
+                k, v = line.split('=', 1)
+                values[k] = v.strip().strip('"\'')
+    except OSError:
+        pass
+    ids = set((values.get('ID', '') + ' ' + values.get('ID_LIKE', '')).split())
+    if ids & {'debian', 'ubuntu', 'linuxmint'}: return 'debian'
+    if ids & {'fedora', 'rhel', 'centos', 'rocky', 'almalinux'}: return 'redhat'
+    if ids & {'arch', 'manjaro', 'endeavouros'}: return 'arch'
+    return 'other'
+
+
+def package_manager():
+    family = distro_family()
+    if family == 'debian' and shutil.which('apt-get'): return 'apt-get'
+    if family == 'redhat' and shutil.which('dnf'): return 'dnf'
+    if family == 'redhat' and shutil.which('yum'): return 'yum'
+    if family == 'arch' and shutil.which('pacman'): return 'pacman'
+    return None
+
+
+def package_available(manager, package):
+    if manager == 'apt-get':
+        p = sp.run(['apt-cache', 'policy', package], capture_output=True, text=True, env={**os.environ, 'LC_ALL': 'C'})
+        return bool(re.search(r'Candidate:\s+(?!\(none\))\S+', p.stdout))
+    args = [manager, '-Si', package] if manager == 'pacman' else [manager, '-q', 'info', package]
+    try:
+        return sp.run(args, stdout=sp.DEVNULL, stderr=sp.DEVNULL, timeout=90).returncode == 0
+    except sp.TimeoutExpired:
+        return False
+
+
+def install_packages(packages, reason):
+    manager = package_manager()
+    if not manager:
+        raise RuntimeError(f'{reason}. Install prebuilt packages manually: {", ".join(packages)}. '
+                           'No supported package manager was detected; nothing was compiled.')
+    unavailable = [p for p in packages if not package_available(manager, p)]
+    if unavailable:
+        raise RuntimeError(f'Prebuilt package(s) unavailable in configured repositories: {unavailable}. '
+                           'Refresh package metadata or use a trusted distro/upstream prebuilt package. '
+                           'No repositories were added and no source build will be attempted.')
+    cmd = ([manager, '-S', '--needed', *packages] if manager == 'pacman'
+           else [manager, 'install', *packages])
     sudo = shutil.which('sudo')
-    if not sudo: raise RuntimeError('sudo unavailable; install the listed packages as administrator and rerun.')
-    if sp.call([sudo, *cmd]) != 0 or any(not shutil.which(x) for x in required):
-        raise RuntimeError('Helper package installation failed.')
+    if not sudo:
+        raise RuntimeError('Administrator must run: ' + shlex.join(cmd) + '; then rerun as desktop user.')
+    say(reason + '\n' + shlex.join([sudo, *cmd]), '33')
+    say('Review the package manager transaction, including any binfmt integration.\n'
+        'Do not approve a transaction that replaces your working emulator setup.', '33')
+    if not yes('Run this prebuilt-package installation?'):
+        raise RuntimeError('Package installation declined.')
+    if sp.call([sudo, *cmd]) != 0:
+        raise RuntimeError('Package manager failed or transaction was cancelled.')
 
 
-def require_fex():
-    fex = shutil.which('FEX')
-    if not fex:
-        raise RuntimeError('FEX is required on ARM64. Install the emulator and its Fedora rootfs '
-                           '(for example: sudo dnf install fex-emu fex-emu-rootfs-fedora), then rerun. '
-                           'Do not install the unrelated package named simply "fex".')
-    images = sorted(Path('/usr/share/fex-emu/RootFS').glob('default*')) if Path('/usr/share/fex-emu/RootFS').is_dir() else []
-    if not images:
-        raise RuntimeError('No FEX rootfs found under /usr/share/fex-emu/RootFS. Configure FEX RootFS '
-                           '(see ~/.fex-emu/Config.json) before creating the Wine prefix.')
-    return Path(fex).resolve()
+def configure_route():
+    global DATA, CACHE, LOG, ROUTE, PREFIX_ARCH, OPTIONS
+    global WINE_ARCHIVE, WINE_SHA256, WINE_URL
+    parser = argparse.ArgumentParser(description='AoE II / Voobly: isolated native, FEX, or Box64 Wine routes. Prebuilt binaries only.')
+    parser.add_argument('--route', choices=('fex', 'box64', 'native'))
+    parser.add_argument('--emulator', type=Path, help='Existing native ARM64 FEX or Box64 executable')
+    OPTIONS = parser.parse_args()
+    machine = platform.machine().lower()
+    arm = machine in ('aarch64', 'arm64')
+    if machine not in ('aarch64', 'arm64', 'x86_64', 'amd64', 'i386', 'i486', 'i586', 'i686', 'x86'):
+        raise RuntimeError(f'Unsupported architecture: {machine}')
+    if arm:
+        route = OPTIONS.route
+        if route == 'native': raise RuntimeError('Native x86 Wine is not an ARM64 route.')
+        if not route:
+            say('ARM64 execution route:\n  1. FEX + Wine 10.0 x86 / win32 prefix\n'
+                '  2. Box64 + Wine 10.0 amd64-wow64 / win64 prefix\n'
+                'Routes use separate runners, prefixes, wrappers, logs, and state.')
+            choice = ask('Select 1/FEX or 2/Box64', '1').lower()
+            if choice not in ('1', '2', 'fex', 'box64'):
+                raise RuntimeError('Invalid route selection.')
+            route = 'box64' if choice in ('2', 'box64') else 'fex'
+    else:
+        route = OPTIONS.route or 'native'
+        if route != 'native' or OPTIONS.emulator:
+            raise RuntimeError('FEX/Box64 routes require an ARM64 host; use native on x86.')
+    ROUTE = route
+    PREFIX_ARCH = 'win64' if route == 'box64' else 'win32'
+    label = route + ('-wow64' if route == 'box64' else '-win32')
+    DATA = BASE_DATA / 'routes' / label
+    CACHE = BASE_CACHE / label
+    LOG = DATA / 'logs' / (STAMP + '.log')
+    flavor = 'amd64-wow64' if route == 'box64' else 'x86'
+    WINE_ARCHIVE = f'wine-{WINE_VERSION}-{flavor}.tar.xz'
+    WINE_SHA256 = ('aeebbbf239e548f0136f1cd72a2e109dd9a572a8f703da3c09fa40d74d5c255f'
+                   if route == 'box64' else
+                   'c5be273749f5c513b3edf7ad79d8214be558b80c67c6ca343d2f17fdcc30c2d2')
+    WINE_URL = f'https://github.com/Kron4ek/Wine-Builds/releases/download/{WINE_VERSION}/{WINE_ARCHIVE}'
+
+
+def require_emulator():
+    if ROUTE == 'native': return None
+    name = 'FEX' if ROUTE == 'fex' else 'box64'
+    supplied = OPTIONS.emulator
+    found = supplied if supplied else shutil.which(name)
+    if not found:
+        install_packages(['fex-emu' if ROUTE == 'fex' else 'box64'], f'{name} is required for the selected route.')
+        found = shutil.which(name)
+    if not found or not Path(found).is_file() or not os.access(found, os.X_OK):
+        raise RuntimeError(f'{name} executable missing. Install a prebuilt package or use --emulator /absolute/path.')
+    resolved = Path(found).resolve()
+    if elf_machine(resolved) != 183:
+        raise RuntimeError(f'Expected a native AArch64 ELF emulator, not a script/foreign binary: {resolved}')
+    if ROUTE == 'fex':
+        say('FEX RootFS must already be configured. Its location is not assumed.\n'
+            'The actual Wine execution probe will verify that configuration.\n'
+            'If needed, use your distribution FEX RootFS package or upstream FEXRootFSFetcher.', '33')
+    return resolved
+
+
+def windows32_dir(prefix):
+    return Path(prefix) / 'drive_c/windows' / ('syswow64' if PREFIX_ARCH == 'win64' else 'system32')
+
+
+def safe_extract(tar, destination):
+    if hasattr(tarfile, 'data_filter'):
+        tar.extractall(destination, filter='data')
+        return
+    # Older distro Python: validate regular files/directories/safe links, then extract.
+    root = Path(destination).resolve()
+    def contained(p):
+        p = p.resolve()
+        return p == root or root in p.parents
+    members = tar.getmembers()
+    for m in members:
+        dest = root / m.name
+        if not contained(dest): raise RuntimeError('Unsafe archive path: ' + m.name)
+        if not (m.isfile() or m.isdir() or m.issym() or m.islnk()):
+            raise RuntimeError('Unsupported archive member: ' + m.name)
+        if (m.issym() or m.islnk()) and (Path(m.linkname).is_absolute() or
+                not contained((dest.parent if m.issym() else root) / m.linkname)):
+            raise RuntimeError('Unsafe archive link: ' + m.name)
+    # Check again as links are materialized, to reject symlink-chain traversal.
+    for m in members:
+        dest = root / m.name
+        if not contained(dest): raise RuntimeError('Unsafe archive traversal: ' + m.name)
+        if (m.issym() or m.islnk()) and not contained((dest.parent if m.issym() else root) / m.linkname):
+            raise RuntimeError('Unsafe archive link chain: ' + m.name)
+        tar.extract(m, destination, set_attrs=False)
+        if m.isfile(): dest.chmod(m.mode & 0o777)
+
+
+def audit_route(prefix, expected):
+    conflicts, observed = [], []
+    if expected == 'native': return conflicts, observed
+    for proc in Path('/proc').glob('[0-9]*'):
+        try:
+            if proc.stat().st_uid != os.getuid(): continue
+            env = (proc / 'environ').read_bytes().split(b'\0')
+            if ('WINEPREFIX=' + str(prefix)).encode() not in env: continue
+            maps = (proc / 'maps').read_text(errors='replace')
+            fex = bool(re.search(r'/FEX(?:Interpreter|Loader)?(?:\s|$)|libFEX', maps, re.M))
+            box = bool(re.search(r'/box64(?:\s|$)', maps, re.M))
+            if fex or box:
+                route = 'fex' if fex else 'box64'
+                observed.append((proc.name, route))
+                if route != expected: conflicts.append((proc.name, route))
+        except (OSError, PermissionError):
+            continue
+    return conflicts, observed
+
+
+def tools():
+    package_commands = {
+        'cabextract': 'cabextract', 'unzip': 'unzip', 'wrestool': 'icoutils',
+        'icotool': 'icoutils', 'curl': 'curl', 'sha256sum': 'coreutils',
+        'sed': 'sed', 'timeout': 'coreutils', 'ss': 'iproute2',
+        'flock': 'util-linux', 'ps': 'procps', 'awk': 'gawk', 'file': 'file',
+        'xz': 'xz-utils', 'tar': 'tar', 'grep': 'grep',
+    }
+    family = distro_family()
+    if family == 'redhat':
+        package_commands.update(ss='iproute', ps='procps-ng', xz='xz')
+    elif family == 'arch':
+        package_commands.update(ps='procps-ng', xz='xz')
+    missing = [c for c in package_commands if not shutil.which(c)]
+    if missing:
+        install_packages(sorted({package_commands[c] for c in missing}),
+                         'Missing helper commands: ' + ', '.join(missing))
+    missing = [c for c in package_commands if not shutil.which(c)]
+    if missing: raise RuntimeError('Commands still unavailable: ' + ', '.join(missing))
+
+
 
 
 def wine_env(prefix, extra=None):
     env = os.environ.copy()
-    for key in ('WINEARCH', 'WINEPREFIX', 'WINEDLLPATH', 'WINELOADER', 'WINESERVER', 'WINE',
-                'WINEDLLOVERRIDES', 'WINE64', 'LD_PRELOAD', 'LD_LIBRARY_PATH',
-                'WINE_DISABLE_FULLSCREEN_HACK', 'STAGING_WRITECOPY'):
-        env.pop(key, None)
-    env.update(WINEPREFIX=str(prefix), WINEARCH='win32', WINEDEBUG='-all',
+    for key in list(env):
+        if key.startswith(('WINE', 'BOX64_', 'BOX86_', 'FEX_')) or key in (
+                'LD_PRELOAD', 'LD_LIBRARY_PATH', 'STAGING_WRITECOPY', 'VOOBLY_DLLOVERRIDES'):
+            env.pop(key, None)
+    env.update(WINEPREFIX=str(prefix), WINEARCH=PREFIX_ARCH, WINEDEBUG='-all',
                WINEDLLOVERRIDES='winemenubuilder.exe=d',
-               WINE=str(DATA / 'bin32' / 'wine'), WINESERVER=str(DATA / 'bin32' / 'wineserver'))
-    env['PATH'] = str(DATA / 'bin32') + ':' + env.get('PATH', '')
+               WINE=str(DATA / 'bin' / 'wine'), WINESERVER=str(DATA / 'bin' / 'wineserver'))
+    env['PATH'] = str(DATA / 'bin') + ':' + env.get('PATH', '')
+    if ROUTE == 'box64':
+        env['BOX64_PATH'] = str(DATA / 'bin') + ':' + str(DATA / 'runners' / f'wine-{WINE_VERSION}-amd64-wow64/bin')
+        env['BOX64_NOBANNER'] = '1'
     if extra: env.update(extra)
     return env
 
 
-WRAPPER_TEMPLATE = '''#!/usr/bin/env bash
-set -uo pipefail
-RUNNER="@RUNNER@"
-NAME="${0##*/}"
-
-case "$NAME" in
-    wine|wineserver) ;;
-    *)
-        printf 'Unexpected wrapper name: %s\\n' "$NAME" >&2
-        exit 2
-        ;;
-esac
-
-unset WINE64 WINELOADER WINEDLLPATH
-unset LD_PRELOAD LD_LIBRARY_PATH
-unset WINE_DISABLE_FULLSCREEN_HACK STAGING_WRITECOPY
-
-export WINE="$RUNNER/bin/wine"
-export WINESERVER="$RUNNER/bin/wineserver"
-export WINEARCH="${WINEARCH:-win32}"
-export PATH="$RUNNER/bin:$PATH"
-export WINEDLLOVERRIDES="winemenubuilder.exe=d${VOOBLY_DLLOVERRIDES:+;$VOOBLY_DLLOVERRIDES}"
-
-@EXEC@ "$RUNNER/bin/$NAME" "$@" | sed '/^erofsfuse [0-9][0-9.]*[[:space:]]*$/d'
-statuses=("${PIPESTATUS[@]}")
-[[ "${statuses[0]}" -eq 0 ]] || exit "${statuses[0]}"
-exit "${statuses[1]}"
-'''
+WRAPPER_TEMPLATE = '#!/usr/bin/env bash\nset -uo pipefail\nRUNNER=@RUNNER_Q@\nBIN=@BIN_Q@\nROUTE=@ROUTE_Q@\nEMULATOR=@EMU_Q@\nPREFIX_ARCH=@ARCH_Q@\nPREFIX_DEFAULT=@PREFIX_Q@\nNAME="${0##*/}"\ncase "$NAME" in wine|wineserver) ;; *) exit 2;; esac\nunset WINE64 WINELOADER WINEDLLPATH LD_PRELOAD LD_LIBRARY_PATH\nunset WINE_DISABLE_FULLSCREEN_HACK STAGING_WRITECOPY\nexport WINE="$BIN/wine" WINESERVER="$BIN/wineserver"\nexport WINEPREFIX="${WINEPREFIX:-$PREFIX_DEFAULT}"\nexport WINEARCH="$PREFIX_ARCH"\nexport PATH="$BIN:$RUNNER/bin:$PATH"\nexport WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-winemenubuilder.exe=d}"\nif [[ "$ROUTE" == box64 ]]; then\n    export BOX64_PATH="$BIN:$RUNNER/bin"\n    export BOX64_NOBANNER=1\nfi\ncmd=("$RUNNER/bin/$NAME")\n[[ "$ROUTE" == native ]] || cmd=("$EMULATOR" "${cmd[@]}")\nif [[ "$NAME" == wine && "${1:-}" == --version ]]; then\n    tmp="$(mktemp)" || exit 1\n    trap \'rm -f -- "$tmp"\' EXIT\n    "${cmd[@]}" "$@" >"$tmp" 2>&1\n    rc=$?\n    if [[ "$rc" -eq 0 ]] && grep -q \'^wine-\' "$tmp"; then\n        sed -n \'/^wine-/p\' "$tmp"\n    else\n        cat "$tmp" >&2\n        [[ "$rc" -ne 0 ]] || rc=1\n    fi\n    exit "$rc"\nfi\n# No pipe between the emulator and application output.\nexec "${cmd[@]}" "$@"\n'
 
 
-def install_wrappers(runner, fex):
-    """Bash wrappers around the runner; they strip only the erofsfuse banner.
-
-    Winetricks parses `wine --version` output as data, so the FEX rootfs mount
-    banner must never reach stdout.
-    """
-    bin_dir = DATA / 'bin32'
+def install_wrappers(runner, fex, prefix=None):
+    bin_dir = DATA / 'bin'
     bin_dir.mkdir(parents=True, exist_ok=True)
-    text = (WRAPPER_TEMPLATE
-            .replace('@RUNNER@', str(runner))
-            .replace('@EXEC@', shlex.quote(str(fex)) if fex else ''))
+    replacements = {
+        '@RUNNER_Q@': shlex.quote(str(runner)), '@BIN_Q@': shlex.quote(str(bin_dir)),
+        '@ROUTE_Q@': shlex.quote(ROUTE), '@EMU_Q@': shlex.quote(str(fex or '')),
+        '@ARCH_Q@': shlex.quote(PREFIX_ARCH), '@PREFIX_Q@': shlex.quote(str(prefix or DATA / 'prefix')),
+    }
+    text = WRAPPER_TEMPLATE
+    for key, value in replacements.items(): text = text.replace(key, value)
     for name in ('wine', 'wineserver'):
         atomic(bin_dir / name, text, 0o755)
+        run(['bash', '-n', bin_dir / name])
     return bin_dir / 'wine', bin_dir / 'wineserver'
 
 
 def install_runner():
-    runner = DATA / 'runners' / f'wine-{WINE_VERSION}-x86'
-    wine = runner / 'bin' / 'wine'
+    flavor = 'amd64-wow64' if ROUTE == 'box64' else 'x86'
+    runner = DATA / 'runners' / f'wine-{WINE_VERSION}-{flavor}'
+    wine = runner / 'bin/wine'
     if not (runner / '.complete').exists():
         archive = download(WINE_URL, CACHE / WINE_ARCHIVE, WINE_SHA256)
         runner.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=runner.parent) as t:
             tmp = Path(t)
-            with tarfile.open(archive) as tar:
-                if not hasattr(tarfile, 'data_filter'):
-                    raise RuntimeError('Safe archive extraction requires Python 3.12+ or a patched tarfile (3.10/3.11).')
-                tar.extractall(tmp, filter='data')
+            with tarfile.open(archive) as tar: safe_extract(tar, tmp)
             candidates = list(tmp.glob('*/bin/wine')) or list(tmp.glob('bin/wine'))
-            if not candidates:
-                raise RuntimeError('Downloaded runner has no bin/wine.')
-            src = candidates[0].parent.parent
-            if runner.exists():
-                raise RuntimeError(f'Incomplete runner exists: {runner}. Inspect it before retrying; nothing was overwritten.')
-            shutil.move(str(src), runner)
-            atomic(runner / '.complete', WINE_VERSION)
-    if not wine.is_file():
-        raise RuntimeError(f'Runner wine binary missing: {wine}')
-    if elf_machine(wine.resolve()) != 3:
-        raise RuntimeError('Runner wine is not a 32-bit x86 ELF; this installer requires the x86 build '
-                           'for the win32 prefix.')
+            if len(candidates) != 1: raise RuntimeError('Runner must contain exactly one bin/wine.')
+            if runner.exists(): raise RuntimeError(f'Incomplete runner exists: {runner}; inspect it first.')
+            shutil.move(str(candidates[0].parent.parent), runner)
+        atomic(runner / '.complete', json.dumps({'version': WINE_VERSION, 'sha256': WINE_SHA256}))
+    expected = 62 if ROUTE == 'box64' else 3
+    for name in ('wine', 'wineserver'):
+        target = runner / 'bin' / name
+        if not target.is_file() or elf_machine(target.resolve()) != expected:
+            raise RuntimeError(f'Wrong ELF architecture or missing runner component: {target}')
     return runner
 
 
 def check_wine_version(wine, prefix, fex):
     rc, text = run([wine, '--version'], env=wine_env(prefix), timeout=120, check=False)
-    # FEX writes mount diagnostics on stderr; only accept the version line itself.
     match = re.search(r'^wine-\S+.*$', text, re.M)
     version = match.group(0).strip() if match else ''
-    say(f'Wine: {version or "(no output)"} | {wine}')
+    say(f'Wine: {version or "(no output)"} | route={ROUTE} | {wine}')
     if rc != 0 or not version:
-        hint = ('verify FEX and its rootfs first: FEXBash -c "uname -m"'
-                if fex else
-                'install 32-bit runtime support for this distribution (e.g. glibc.i686 / libc6:i386)')
-        raise RuntimeError(f'Wine did not execute through the selected route; {hint}.\n{text[-1500:]}')
-    if not version.startswith(f'wine-{WINE_VERSION}'):
-        raise RuntimeError(f'Unexpected Wine version {version!r}; this installer expects wine-{WINE_VERSION} '
-                           'and the FEX mount banner must be filtered from stdout.')
+        hints = {
+            'fex': 'Verify configured FEX RootFS and that the selected FEX can execute x86 Linux binaries.',
+            'box64': 'Verify the native ARM64 Box64 package and its native library dependencies. '
+                     'Do not use the x86 Wine runner or reuse the FEX prefix.',
+            'native': 'Install your distro prebuilt 32-bit Linux runtime support (including graphics/audio).',
+        }
+        raise RuntimeError(hints[ROUTE] + '\n' + text[-2500:])
+    if not re.match(r'^wine-10\.0(?:\s|$)', version):
+        raise RuntimeError('Unexpected runner version: ' + version)
     return version
 
 
 def create_prefix(wine, prefix, state, save):
     fresh = not (prefix / 'system.reg').exists()
     if fresh and prefix.exists() and any(prefix.iterdir()):
-        raise RuntimeError('Prefix directory is not empty and not a managed Wine prefix; choose an empty path.')
+        raise RuntimeError('Prefix directory is nonempty and is not a managed Wine prefix.')
     prefix.mkdir(parents=True, exist_ok=True)
     if fresh:
         run([wine, 'wineboot', '--init'], env=wine_env(prefix), timeout=300)
         state['prefix_created'] = True; save()
     arch = prefix_arch(prefix)
-    if arch != 'win32':
-        raise RuntimeError(f'Expected a win32 prefix, found arch={arch!r}. Do not reuse a 64-bit/WoW64 prefix.')
+    if arch != PREFIX_ARCH:
+        raise RuntimeError(f'Expected {PREFIX_ARCH} prefix for {ROUTE}, found {arch!r}; no conversion is attempted.')
     for name in ('cmd.exe', 'ntdll.dll', 'kernel32.dll'):
-        target = prefix / 'drive_c/windows/system32' / name
-        if not target.is_file():
-            raise RuntimeError(f'Missing prefix file: {target}')
-    rc, text = run([wine, str(prefix / 'drive_c/windows/system32/cmd.exe'), '/c', 'echo WIN32_PREFIX_OK'],
+        target = windows32_dir(prefix) / name
+        if not target.is_file() or pe_machine(target) != 0x14c:
+            raise RuntimeError(f'Missing or non-i386 Windows component: {target}')
+    probe = windows32_dir(prefix) / 'cmd.exe'
+    rc, text = run([wine, str(probe), '/d', '/c', 'echo WIN32_APP_OK'],
                    env=wine_env(prefix), timeout=120, check=False)
-    if rc != 0 or 'WIN32_PREFIX_OK' not in text:
-        raise RuntimeError('32-bit console execution failed in this prefix; inspect the log before continuing.')
-    # Windows 10 is Wine 10's default; set it explicitly to match the reference setup.
+    if rc or 'WIN32_APP_OK' not in text:
+        raise RuntimeError('32-bit Windows execution failed in this prefix.\n' + text[-2000:])
     run([wine, 'reg', 'add', r'HKCU\Software\Wine', '/v', 'Version', '/d', 'win10', '/f'],
-        env=wine_env(prefix), check=False)
-    # Virtual desktop breaks Explorer startup on this runner family; keep it unset.
-    run([wine, 'reg', 'delete', r'HKCU\Software\Wine\Explorer', '/v', 'Desktop', '/f'],
-        env=wine_env(prefix), check=False)
+        env=wine_env(prefix))
+    say('32-bit Windows cmd.exe executed successfully.', '32')
+    conflicts, observed = audit_route(prefix, ROUTE)
+    logging.info('Route audit expected=%s observed=%s', ROUTE, observed)
+    if conflicts: raise RuntimeError(f'Wrong emulator detected for this prefix: {conflicts}')
 
 
 DRIVE_ORDER = 'yxwvutsrqponmlkjihgfed'
@@ -396,48 +543,35 @@ def choose_drive(prefix, source):
 
 
 def map_drive(wine, prefix, source, aoc_rel):
-    """Make the game reachable through a drive letter, or fall back to Z:.
-
-    A running wineserver keeps the drive list it started with, so a mapping
-    created afterwards is invisible until that server restarts. Retry with a
-    restart before giving up.
-    """
-    servers = DATA / 'bin32' / 'wineserver'
     rel_win = str(aoc_rel).replace('/', '\\')
-    drive = 'Z:'
-    win_path = ('Z:' + str(Path(source).resolve())).replace('/', '\\') + '\\' + rel_win
-    for attempt in range(3):
-        try:
-            letter = choose_drive(prefix, source)
-        except RuntimeError as exc:
-            say(f'{exc} Falling back to Z:.', '33')
-            break
+    try:
+        letter = choose_drive(prefix, source)
         drive = letter.upper() + ':'
         win_path = drive + '\\' + rel_win
-        rc, text = run([wine, 'cmd', '/c', f'dir {win_path}'], env=wine_env(prefix),
-                       timeout=180, check=False)
-        if rc == 0 and Path(aoc_rel).name.casefold() in text.casefold():
+        rc, text = run([wine, 'cmd', '/d', '/c', f'if exist "{win_path}" echo AOE_DRIVE_OK'],
+                       env=wine_env(prefix), timeout=120, check=False)
+        if rc == 0 and 'AOE_DRIVE_OK' in text:
             return drive, win_path
-        logging.warning('Drive %s not visible (attempt %s)', drive, attempt + 1)
-        run([servers, '-k'], env=wine_env(prefix), timeout=60, check=False)
-        run([servers, '-w'], env=wine_env(prefix), timeout=60, check=False)
-    rc, text = run([wine, 'cmd', '/c', f'dir {win_path}'], env=wine_env(prefix), timeout=180, check=False)
-    if rc != 0 or Path(aoc_rel).name.casefold() not in text.casefold():
-        logging.warning('Z: verification output: %s', text[-800:])
-    say(f'WARNING: Wine does not list a spare drive letter; Voobly should use {win_path}', '33')
+        say('Drive mapping is on disk but not visible to the running Wine server. Using Z: for diagnostics.', '33')
+    except RuntimeError as exc:
+        say(str(exc), '33')
+    win_path = ('Z:' + str(Path(source).resolve())).replace('/', '\\') + '\\' + rel_win
+    rc, text = run([wine, 'cmd', '/d', '/c', f'if exist "{win_path}" echo AOE_DRIVE_OK'],
+                   env=wine_env(prefix), timeout=120, check=False)
+    if rc or 'AOE_DRIVE_OK' not in text:
+        raise RuntimeError('Game is not accessible through the selected Wine route.\n' + text[-1500:])
     return 'Z:', win_path
 
 
 def backup_game(source):
     source = Path(source)
     target = source.with_name(source.name + f'.backup-{STAMP}')
-    needed = sum(p.stat().st_size for p in source.rglob('*') if p.is_file())
+    needed = sum(p.stat().st_size for p in source.rglob('*') if p.is_file() and not p.is_symlink())
     free = shutil.disk_usage(source.parent).free
     say(f'Game backup: {target}\nSize: {needed // 1048576} MiB | free: {free // 1048576} MiB')
     if free < needed + 512 * 1024 * 1024:
-        say('Not enough free space for a full game backup; skipping it.', '33')
-        return None
-    shutil.copytree(source, target, symlinks=False)
+        raise RuntimeError('Not enough space for requested game backup; free space or explicitly decline it on rerun.')
+    shutil.copytree(source, target, symlinks=True)
     return target
 
 
@@ -451,6 +585,7 @@ def backup_prefix(prefix, label):
 def install_winetricks():
     wt = DATA / 'tools' / 'winetricks'
     if wt.is_file():
+        run(['bash', '-n', wt])
         return wt
     commit = api('https://api.github.com/repos/Winetricks/winetricks/commits/master')['sha']
     download(f'https://raw.githubusercontent.com/Winetricks/winetricks/{commit}/src/winetricks', wt)
@@ -461,35 +596,35 @@ def install_winetricks():
 
 
 def directplay_registered(wine, prefix):
-    rc, text = run([wine, 'reg', 'query', r'HKCU\Software\Wine\DllOverrides'],
+    rc, text = run([wine, 'reg', 'query', r'HKCU\Software\Wine\DllOverrides', '/v', 'dplayx'],
                    env=wine_env(prefix), check=False)
-    return rc == 0 and 'dplayx' in text.casefold()
+    return rc == 0 and bool(re.search(r'REG_SZ\s+(?:native|n)(?:\s|,|$)', text, re.I))
 
 
 def install_components(wine, prefix, state, save):
-    system32 = prefix / 'drive_c/windows/system32'
-    have_dlls = all((system32 / n).is_file() for n in DIRECTPLAY_FILES)
-    if have_dlls and directplay_registered(wine, prefix):
-        say('Native DirectPlay is installed and registered; skipping Winetricks.', '32')
-    else:
-        if have_dlls:
-            say('DirectPlay DLLs exist but its DLL overrides are missing; repairing.', '33')
-        backup = backup_prefix(prefix, 'before-multiplayer')
+    directory = windows32_dir(prefix)
+    wt = install_winetricks()
+    env = wine_env(prefix, {'WINETRICKS_CACHE': str(CACHE / 'winetricks'),
+                            'XDG_CACHE_HOME': str(CACHE / 'xdg')})
+    rc, installed = run([wt, 'list-installed'], env=env, check=False)
+    have = all((directory / n).is_file() and pe_machine(directory / n) == 0x14c for n in DIRECTPLAY_FILES)
+    ready = have and rc == 0 and 'directplay' in installed.splitlines() and directplay_registered(wine, prefix)
+    if not ready:
+        if not yes("Close this route's Wine applications and install/repair native DirectPlay?", True):
+            raise RuntimeError('DirectPlay setup declined.')
+        server = DATA / 'bin/wineserver'
+        run([server, '-k'], env=env, timeout=30, check=False)
+        run([server, '-w'], env=env, timeout=45)
+        backup = backup_prefix(prefix, 'before-directplay')
         say(f'Prefix backup: {backup}')
-        wt = install_winetricks()
-        env = wine_env(prefix, {'WINETRICKS_CACHE': str(CACHE / 'winetricks')})
-        # Only native DirectPlay is needed; no corefonts, renderers, runtimes or quartz.
-        for component in ('directplay',):
-            say(f'Installing/checking Winetricks component: {component}')
-            run([str(wt), '-q', component], env=env, timeout=1200)
-        missing = [n for n in DIRECTPLAY_FILES if not (system32 / n).is_file()]
-        if missing:
-            raise RuntimeError('DirectPlay installation is incomplete; missing: ' + ', '.join(missing))
-        run([str(wt), 'list-installed'], env=env, check=False)
-    # dpnlobby has no Microsoft DLL here; leaving a native override breaks DirectPlay.
+        run([wt, '-q', 'directplay'], env=env, timeout=1200)
+    missing = [n for n in DIRECTPLAY_FILES if not (directory / n).is_file()
+               or pe_machine(directory / n) != 0x14c]
+    if missing or not directplay_registered(wine, prefix):
+        raise RuntimeError(f'32-bit DirectPlay verification failed in {directory}; files={missing}')
     for value in ('dpnlobby', '*dpnlobby'):
         run([wine, 'reg', 'delete', r'HKCU\Software\Wine\DllOverrides', '/v', value, '/f'],
-            env=wine_env(prefix), check=False)
+            env=env, check=False)
     state['components'] = True; save()
 
 
@@ -528,129 +663,24 @@ def make_icon(exe, ident, title):
     return svg
 
 
-LAUNCHER_TEMPLATE = '''#!/usr/bin/env bash
-set -uo pipefail
-umask 077
-
-BASE="@BASE@"
-RUNNER="@RUNNER@"
-PREFIX="@PREFIX@"
-GAME="@GAME@"
-DRIVE_PREF="@DRIVE_PREF@"
-GAME_REL="@GAME_REL@"
-MARKER="@MARKER@"
-FIXED_TARGET="@TARGET@"
-LOG="$BASE/logs/@SLUG@-$(date +%Y%m%d-%H%M%S).log"
-
-[[ -x "$RUNNER/bin/wine" ]] || { echo "STOP: Wine runner is missing." >&2; exit 1; }
-[[ -f "$PREFIX/system.reg" ]] || { echo "STOP: Wine prefix is missing." >&2; exit 1; }
-grep -q '^#arch=win32$' "$PREFIX/system.reg" || { echo "STOP: expected a win32 prefix." >&2; exit 1; }
-
-unset WINE64 WINELOADER WINEDLLPATH
-unset LD_PRELOAD LD_LIBRARY_PATH
-unset WINE_DISABLE_FULLSCREEN_HACK STAGING_WRITECOPY
-
-export WINE="$RUNNER/bin/wine"
-export WINESERVER="$RUNNER/bin/wineserver"
-export WINEPREFIX="$PREFIX"
-export WINEARCH=win32
-export PATH="$RUNNER/bin:$PATH"
-export WINEDLLOVERRIDES='winemenubuilder.exe=d'
-export WINEDEBUG='-all,err+all'
-
-# Wine rewrites dosdevices during wineboot and can renumber drive letters, so the
-# mapping is (re)created here and checked through Wine itself.
-ensure_drive() {
-    local preferred="$1" letter link
-    for letter in "$preferred" y x w v u t s r q p o n m l k j i h g f e d; do
-        link="$PREFIX/dosdevices/$letter:"
-        if [[ "$(readlink -f "$link" 2>/dev/null)" == "$(readlink -f "$GAME")" ]]; then
-            printf '%s:' "${letter^^}"
-            return 0
-        fi
-    done
-    for letter in "$preferred" y x w v u t s r q p o n m l k j i h g f e d; do
-        link="$PREFIX/dosdevices/$letter:"
-        if [[ ! -e "$link" && ! -L "$link" ]]; then
-            ln -s "$GAME" "$link" && printf '%s:' "${letter^^}" && return 0
-        fi
-    done
-    return 1
-}
-
-wine_sees_drive() {
-    [[ -n "${1:-}" ]] || return 1
-    "$WINE" cmd /d /c "if exist ${1}\\\\${MARKER} echo AOE_DRIVE_OK" 2>/dev/null | grep -q AOE_DRIVE_OK
-}
-
-DRIVE=""
-if [[ -z "$GAME_REL" ]]; then
-    DRIVE="$(ensure_drive "$DRIVE_PREF" 2>/dev/null || true)"
-    if [[ -n "$DRIVE" ]] && ! wine_sees_drive "$DRIVE"; then
-        "$WINESERVER" -k >/dev/null 2>&1 || true
-        "$WINESERVER" -w >/dev/null 2>&1 || true
-        DRIVE="$(ensure_drive "$DRIVE_PREF" 2>/dev/null || true)"
-        if [[ -n "$DRIVE" ]] && ! wine_sees_drive "$DRIVE"; then
-            echo "WARNING: $DRIVE exists on disk but Wine does not list it." >&2
-            echo "         In Voobly, use Z: and the game folder instead." >&2
-        fi
-    fi
-    if [[ -z "$DRIVE" ]]; then
-        echo "WARNING: no free drive letter for $GAME; in Voobly use Z: paths." >&2
-    fi
-fi
-
-# Games always start through the Unix path, which cannot break on a drive change.
-if [[ -n "$GAME_REL" ]]; then
-    TARGET="$GAME/$GAME_REL"
-    [[ -f "$TARGET" ]] || { echo "STOP: game executable missing: $TARGET" >&2; exit 1; }
-else
-    TARGET="$FIXED_TARGET"
-    [[ -e "$TARGET" ]] || { echo "STOP: executable missing: $TARGET" >&2; exit 1; }
-fi
-
-mkdir -p "$BASE/logs"
-cd "$GAME" || exit 1
-
-# A leftover DirectPlay helper holding port 47624 makes session creation fail
-# silently (return to the connection screen). Clear it when nothing is playing.
-HELPER="$BASE/tools/clear-directplay-conflict.sh"
-if [[ -x "$HELPER" ]]; then
-    helper_out="$("$HELPER" --auto 2>&1 || true)"
-    if [[ -n "$helper_out" ]]; then
-        printf '%s\\n' "$helper_out"
-    fi
-fi
-
-printf 'Starting @TITLE@ without a time limit.\\nLog: %s\\n' "$LOG"
-
-@EXEC@ "$RUNNER/bin/wine" "$TARGET" @ARGS@ "$@" >"$LOG" 2>&1
-rc=$?
-
-printf '@SLUG@_EXIT=%s\\nLog: %s\\n' "$rc" "$LOG"
-if [[ "$rc" -ne 0 ]]; then
-    tail -n 80 "$LOG"
-fi
-exit "$rc"
-'''
+LAUNCHER_TEMPLATE = '#!/usr/bin/env bash\nset -uo pipefail\numask 077\nBASE=@BASE_Q@\nRUNNER=@RUNNER_Q@\nPREFIX=@PREFIX_Q@\nGAME=@GAME_Q@\nDRIVE_PREF=@DRIVE_Q@\nGAME_REL=@REL_Q@\nMARKER=@MARKER_Q@\nFIXED_TARGET=@TARGET_Q@\nPREFIX_ARCH=@ARCH_Q@\nROUTE=@ROUTE_Q@\nTITLE=@TITLE_Q@\nBIN="$BASE/bin"\nLOG="$BASE/logs/@SLUG@-$(date +%Y%m%d-%H%M%S)-$$.log"\n[[ -x "$BIN/wine" && -x "$RUNNER/bin/wine" ]] || { echo \'Wine runner/wrapper missing.\' >&2; exit 1; }\n[[ -f "$PREFIX/system.reg" ]] || { echo \'Prefix missing.\' >&2; exit 1; }\ngrep -q "^#arch=$PREFIX_ARCH\\$" "$PREFIX/system.reg" || { echo \'Wrong prefix architecture.\' >&2; exit 1; }\nfor var in ${!WINE@} ${!BOX64_@} ${!BOX86_@} ${!FEX_@}; do\n    unset "$var"\ndone\nunset LD_PRELOAD LD_LIBRARY_PATH STAGING_WRITECOPY VOOBLY_DLLOVERRIDES\nexport WINE="$BIN/wine" WINESERVER="$BIN/wineserver"\nexport WINEPREFIX="$PREFIX" WINEARCH="$PREFIX_ARCH"\nexport PATH="$BIN:$RUNNER/bin:$PATH"\nexport WINEDLLOVERRIDES=\'winemenubuilder.exe=d\'\nexport WINEDEBUG=\'-all,err+all\'\nmkdir -p "$BASE/logs"\n# Locks are per shared game directory, not per emulator/prefix.\nLOCKFILE=@LOCK_Q@\nmkdir -p "$(dirname "$LOCKFILE")"\nexec 9>"$LOCKFILE"\nflock -n 9 || { echo \'Another managed game/Voobly launcher is using this game directory.\' >&2; exit 1; }\nHELPER="$BASE/tools/clear-directplay-conflict.sh"\nif [[ -x "$HELPER" ]]; then\n    "$HELPER" --check || {\n        echo "Inspect/close existing games first. For confirmed stale helpers run: $HELPER" >&2\n        exit 1\n    }\nfi\nensure_drive() {\n    local letter link\n    for letter in "$DRIVE_PREF" y x w v u t s r q p o n m l k j i h g f e d; do\n        link="$PREFIX/dosdevices/$letter:"\n        if [[ "$(readlink -f "$link" 2>/dev/null)" == "$(readlink -f "$GAME")" ]]; then\n            printf \'%s:\' "${letter^^}"; return\n        fi\n    done\n    for letter in "$DRIVE_PREF" y x w v u t s r q p o n m l k j i h g f e d; do\n        link="$PREFIX/dosdevices/$letter:"\n        if [[ ! -e "$link" && ! -L "$link" ]]; then\n            ln -s -- "$GAME" "$link" || return 1\n            printf \'%s:\' "${letter^^}"; return\n        fi\n    done\n    return 1\n}\nif [[ -n "$GAME_REL" ]]; then\n    TARGET="$GAME/$GAME_REL"\nelse\n    TARGET="$FIXED_TARGET"\n    DRIVE="$(ensure_drive || true)"\n    if [[ -n "$DRIVE" ]]; then\n        printf \'Game mapping: %s -> %s\\n\' "$DRIVE" "$GAME"\n    else\n        echo \'No spare drive letter; select the game through Z: in Voobly.\' >&2\n    fi\nfi\n[[ -f "$TARGET" ]] || { echo "Missing executable: $TARGET" >&2; exit 1; }\ncd "$GAME" || exit 1\nprintf \'Starting %s via %s without a time limit.\\nLog: %s\\n\' "$TITLE" "$ROUTE" "$LOG"\n"$WINE" "$TARGET" @ARGS@ "$@" 9>&- >"$LOG" 2>&1 &\nchild=$!\n# Sample process mappings to flag accidental fallback to the other emulator.\nsleep 1\nif ! python3 "$BASE/tools/audit-route.py" "$PREFIX" "$ROUTE" >>"$LOG" 2>&1; then\n    echo "Wrong emulator detected. Close the application; inspect $LOG" >&2\nfi\nwait "$child"\nrc=$?\nprintf \'@SLUG@_EXIT=%s\\nLog: %s\\n\' "$rc" "$LOG"\n[[ "$rc" -eq 0 ]] || tail -n 80 "$LOG"\nexit "$rc"\n'
 
 
 def make_launcher(slug, title, target, args, runner, prefix, source, drive, fex, rel='', marker=''):
-    text = (LAUNCHER_TEMPLATE
-            .replace('@BASE@', str(DATA))
-            .replace('@RUNNER@', str(runner))
-            .replace('@PREFIX@', str(prefix))
-            .replace('@GAME@', str(source))
-            .replace('@DRIVE_PREF@', 'y' if drive.upper().startswith('Z') else drive[0].lower())
-            .replace('@GAME_REL@', rel)
-            .replace('@MARKER@', marker)
-            .replace('@TARGET@', target)
-            .replace('@SLUG@', slug)
-            .replace('@TITLE@', title)
-            .replace('@ARGS@', args)
-            .replace('@EXEC@', shlex.quote(str(fex)) if fex else ''))
-    path = DATA / 'bin32' / slug
+    gameid = hashlib.sha256(str(Path(source).resolve()).encode()).hexdigest()[:24]
+    values = {
+        '@BASE_Q@': DATA, '@RUNNER_Q@': runner, '@PREFIX_Q@': prefix,
+        '@GAME_Q@': source, '@DRIVE_Q@': 'y' if drive.upper().startswith('Z') else drive[0].lower(),
+        '@REL_Q@': rel, '@MARKER_Q@': marker, '@TARGET_Q@': target,
+        '@ARCH_Q@': PREFIX_ARCH, '@ROUTE_Q@': ROUTE, '@TITLE_Q@': title,
+        '@LOCK_Q@': BASE_DATA / 'locks' / (gameid + '.lock'),
+    }
+    text = LAUNCHER_TEMPLATE
+    for key, value in values.items(): text = text.replace(key, shlex.quote(str(value)))
+    text = text.replace('@SLUG@', slug).replace('@ARGS@', shlex.join(shlex.split(args)))
+    path = DATA / 'bin' / slug
     atomic(path, text, 0o755)
+    run(['bash', '-n', path])
     return path
 
 
@@ -658,7 +688,7 @@ def menu_entry(slug, title, launcher, icon, ident, source):
     key = f'aoe2-voobly-{ident}-{slug}'
     file = APPS / (key + '.desktop')
     text = '[Desktop Entry]\nType=Application\nVersion=1.0\n'
-    text += f'Name={title}\nComment=AoE II through the dedicated Voobly Wine prefix\n'
+    text += f'Name={title} ({ROUTE})\nComment=AoE II through the isolated {ROUTE} Wine prefix\n'
     text += 'Exec=' + exec_quote(launcher) + '\n'
     text += f'Path={desktop_escape(source)}\nIcon={desktop_escape(icon)}\nTerminal=false\n'
     text += 'Categories=Game;StrategyGame;\nStartupNotify=false\n'
@@ -669,129 +699,17 @@ def menu_entry(slug, title, launcher, icon, ident, source):
     return file
 
 
-PORT_HELPER = r'''#!/usr/bin/env bash
-set -euo pipefail
-umask 077
-
-MODE="interactive"
-PORT="47624"
-case "${1:-}" in
-    --auto) MODE="auto" ;;
-    "") ;;
-    *) PORT="$1" ;;
-esac
-
-PREFIX="${WINEPREFIX:-}"
-
-command -v ss >/dev/null || { echo "STOP: ss (iproute2) is required to inspect port $PORT." >&2; exit 1; }
-
-sockets() { ss -H -lntup "sport = :$PORT" || true; }
-
-owner_pids() { sockets | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u; }
-
-is_helper() {
-    local pid="$1"
-    [[ -r "/proc/$pid/comm" ]] || return 1
-    [[ "$(stat -c '%u' "/proc/$pid")" == "$(id -u)" ]] || return 1
-    [[ "$(tr '[:upper:]' '[:lower:]' < "/proc/$pid/comm")" == "dplaysvr.exe" ]] || return 1
-}
-
-prefix_of() {
-    tr '\0' '\n' < "/proc/$1/environ" 2>/dev/null | sed -n 's/^WINEPREFIX=//p' | head -1
-}
-
-game_running() {
-    local pid comm pfx
-    for pid in /proc/[0-9]*; do
-        pid="${pid##*/}"
-        [[ -r "/proc/$pid/comm" ]] || continue
-        comm="$(tr '[:upper:]' '[:lower:]' < "/proc/$pid/comm")"
-        case "$comm" in
-            empires2.exe|age2_x1.exe|age2.exe|voobly.exe) ;;
-            *) continue ;;
-        esac
-        pfx="$(prefix_of "$pid")"
-        if [[ -z "$PREFIX" || "$pfx" == "$PREFIX" ]]; then
-            return 0
-        fi
-    done
-    return 1
-}
-
-if [[ "$MODE" != auto ]]; then
-    echo "========== Owners of port $PORT =========="
-    sockets
-    echo
-fi
-
-stopped=0
-for pid in $(owner_pids); do
-    is_helper "$pid" || continue
-    if [[ -n "$PREFIX" && "$(prefix_of "$pid")" != "$PREFIX" ]]; then
-        continue
-    fi
-    if [[ "$MODE" == auto ]]; then
-        if game_running; then
-            continue
-        fi
-        kill -TERM "$pid" 2>/dev/null || true
-        stopped=1
-        continue
-    fi
-    echo "----------------------------------------"
-    ps -p "$pid" -o pid,ppid,user,stat,etime,args
-    echo "Prefix recorded in process environment:"
-    tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null |
-        grep -E '^(WINEPREFIX|WINEARCH|WINESERVER)=' || true
-    echo
-    read -r -p "Stop this stale DirectPlay helper, PID $pid? [y/N] " answer
-    case "$answer" in
-        y|Y|yes|YES) ;;
-        *) echo "Kept PID $pid."; continue ;;
-    esac
-    kill -TERM "$pid" 2>/dev/null || true
-    for _ in $(seq 1 10); do
-        kill -0 "$pid" 2>/dev/null || break
-        sleep 1
-    done
-    if kill -0 "$pid" 2>/dev/null; then
-        read -r -p "PID $pid is still running. Force-stop it? [y/N] " answer
-        case "$answer" in
-            y|Y|yes|YES) kill -KILL "$pid" 2>/dev/null || true ;;
-            *) echo "Not force-stopped." ;;
-        esac
-    fi
-done
-
-if [[ "$MODE" == auto ]]; then
-    if (( stopped )); then
-        for _ in $(seq 1 10); do
-            [[ -z "$(sockets)" ]] && break
-            sleep 0.5
-        done
-        [[ -z "$(sockets)" ]] && echo "Stopped a stale DirectPlay helper holding port $PORT."
-    fi
-    exit 0
-fi
-
-echo
-echo "========== Port $PORT after cleanup =========="
-if [[ -n "$(sockets)" ]]; then
-    sockets
-    echo "Port is still occupied. Do not retest yet."
-    exit 1
-fi
-echo "Port $PORT is free."
-echo "No game files, DLL overrides, firewall or network settings were changed."
-'''
+PORT_HELPER = '#!/usr/bin/env bash\nset -euo pipefail\nMODE="${1:-interactive}"\ncase "$MODE" in --check|--auto|interactive) ;; *) echo \'Usage: helper [--check]\' >&2; exit 2;; esac\nDEFAULT_PREFIX=@PREFIX_Q@\nPREFIX="${WINEPREFIX:-$DEFAULT_PREFIX}"\ncommand -v ss >/dev/null || { echo \'ss is required (iproute2/iproute).\' >&2; exit 1; }\nsockets() { ss -H -lntup \'sport = :47624\'; }\ncurrent="$(sockets)"\n[[ -n "$current" ]] || exit 0\nprintf \'Port 47624 is occupied; an owner is not automatically stale:\\n%s\\n\' "$current"\nif [[ "$MODE" != interactive ]]; then\n    echo \'No process was stopped. Close active applications and inspect the helper manually.\' >&2\n    exit 1\nfi\nprefix_of() { tr \'\\0\' \'\\n\' <"/proc/$1/environ" 2>/dev/null | sed -n \'s/^WINEPREFIX=//p\'; }\nstart_of() { sed \'s/^.*) //\' "/proc/$1/stat" | awk \'{print $20}\'; }\nvalid() {\n    local pid="$1"\n    [[ -O "/proc/$pid" && -r "/proc/$pid/comm" ]] || return 1\n    [[ "$(tr \'[:upper:]\' \'[:lower:]\' <"/proc/$pid/comm")" == dplaysvr.exe ]] || return 1\n    [[ "$(prefix_of "$pid")" == "$PREFIX" ]] || return 1\n}\n# Never terminate a helper while a recognized live game or Voobly client exists, in any prefix.\nfor p in /proc/[0-9]*; do\n    [[ -O "$p" && -r "$p/comm" ]] || continue\n    name="$(tr \'[:upper:]\' \'[:lower:]\' <"$p/comm" 2>/dev/null || true)"\n    case "$name" in\n        empires2.exe|age2_x1.exe|age2.exe|age2x1.exe|voobly.exe)\n            state="$(awk \'{print $3}\' "$p/stat" 2>/dev/null || true)"\n            if [[ "$state" != Z ]]; then\n                echo \'Close all games and Voobly clients before terminating helpers.\' >&2; exit 1\n            fi;;\n    esac\ndone\nfor pid in $(printf \'%s\\n\' "$current" | grep -o \'pid=[0-9]*\' | cut -d= -f2 | sort -u); do\n    valid "$pid" || continue\n    start="$(start_of "$pid")"\n    ps -p "$pid" -o pid,ppid,user,stat,etime,args\n    read -r -p "Stop this confirmed leftover helper in $PREFIX? [y/N] " answer </dev/tty\n    case "$answer" in y|Y|yes|YES) ;; *) continue;; esac\n    valid "$pid" && [[ "$(start_of "$pid")" == "$start" ]] || continue\n    kill -TERM "$pid" 2>/dev/null || true\n    for _ in {1..10}; do\n        [[ -d "/proc/$pid" ]] || break\n        sleep 1\n    done\n    if valid "$pid" && [[ "$(start_of "$pid")" == "$start" ]]; then\n        state="$(awk \'{print $3}\' "/proc/$pid/stat" 2>/dev/null || true)"\n        if [[ "$state" != Z ]]; then\n            read -r -p "Same helper remains. Force-stop PID $pid? [y/N] " answer </dev/tty\n            case "$answer" in\n                y|Y|yes|YES)\n                    valid "$pid" && [[ "$(start_of "$pid")" == "$start" ]] && kill -KILL "$pid" || true;;\n            esac\n        fi\n    fi\ndone\nsleep 1\nleft="$(sockets)"\n[[ -z "$left" ]] || { printf \'Port remains occupied:\\n%s\\n\' "$left"; exit 1; }\necho \'Port 47624 is free. No game files or network configuration were changed.\'\n'
 
 
 def main():
+    if sys.version_info < (3, 9): raise RuntimeError('Python 3.9 or newer is required; install a prebuilt distro Python.')
     if sys.platform != 'linux': raise RuntimeError('This utility supports Linux only.')
+    configure_route()
     if os.geteuid() == 0: raise RuntimeError('Run as your desktop user, not root or sudo.')
     LOG.parent.mkdir(parents=True, exist_ok=True); CACHE.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(filename=LOG, level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-    lock = (DATA / 'installer.lock').open('w')
+    lock = (BASE_DATA / 'installer.lock').open('w')
     try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError: raise RuntimeError('Another installer is already running.')
     say('\n╔══════════════════════════════════════════════════════════════╗\n'
@@ -828,37 +746,44 @@ def main():
     if not os.environ.get('DISPLAY'):
         say('Wayland-only session: Wine may require working XWayland unless its Wayland driver is configured.', '33')
 
-    ident = hashlib.sha256(str(prefix).encode()).hexdigest()[:12]
+    ident = ROUTE + '-' + hashlib.sha256(str(prefix).encode()).hexdigest()[:12]
     statefile = DATA / 'installs' / (ident + '.json')
     state = json.loads(statefile.read_text()) if statefile.exists() else {'id': ident, 'source': str(source)}
     if state['source'] != str(source): raise RuntimeError('This prefix is registered to a different source; select a new prefix.')
     if prefix.exists() and any(prefix.iterdir()) and not statefile.exists():
         raise RuntimeError('Nonempty unmanaged prefix: refusing to mutate it. Choose a new empty prefix.')
 
+    if state.get('route', ROUTE) != ROUTE:
+        raise RuntimeError('Prefix belongs to another execution route.')
+    if prefix_arch(prefix) not in (None, PREFIX_ARCH):
+        raise RuntimeError('Prefix architecture does not match this route; select a new prefix.')
+    state.update(route=ROUTE, prefix_architecture=PREFIX_ARCH)
     say(f'\nHost: {machine}\nOriginal: {source}\nConquerors: {aoc_rel}\nSetup: {setup}\nPrefix: {prefix}')
-    say('Strategy: existing game mapped read-write on a free Wine drive, Wine 10 x86 in a dedicated win32 prefix')
+    say(f'Route: {ROUTE} | Wine archive: {WINE_ARCHIVE} | prefix: {PREFIX_ARCH}\n'
+        f'Workspace: {DATA}\nExisting game is shared read-write; other routes are not modified.')
     if not yes('Proceed with this configuration?', True): return
     def save(): atomic(statefile, json.dumps(state, indent=2))
 
-    stage(2, 'Architecture, FEX and helper preflight')
+    stage(2, 'Distribution, prebuilt emulator and helper preflight')
     fex = None
     if arch == 'arm64':
-        fex = require_fex()
-        say(f'FEX: {fex} (x86 binaries run through FEX; rootfs present)', '32')
+        fex = require_emulator()
+        say(f'{ROUTE}: {fex} (explicit native ARM64 emulator)', '32')
     else:
-        say('Native x86 CPU: FEX is not used.', '32')
+        say('Native x86 CPU: no emulator is used.', '32')
     tools()
 
-    stage(3, 'Install and verify the Wine 10.0 x86 runner')
-    say('Runner: Kron4ek wine-10.0-x86 (32-bit only, pinned SHA256)')
+    stage(3, 'Install and verify the route-specific prebuilt Wine runner')
+    say(f'Runner: Kron4ek {WINE_ARCHIVE} (pinned SHA256)')
     runner = install_runner()
-    wine, _ = install_wrappers(runner, fex)
+    wine, _ = install_wrappers(runner, fex, prefix)
     version = check_wine_version(wine, prefix, fex)
-    state.update(wine=str(wine), runner=str(runner), fex=bool(fex), arch=arch, version=version); save()
+    state.update(wine=str(wine), runner=str(runner), route=ROUTE, emulator=str(fex or ''), arch=arch, version=version); save()
+    atomic(DATA / 'tools/audit-route.py', "#!/usr/bin/env python3\nimport os, re, sys\nfrom pathlib import Path\nprefix, expected = sys.argv[1:3]\nseen = []\nwrong = []\nfor p in Path('/proc').glob('[0-9]*'):\n    try:\n        if p.stat().st_uid != os.getuid(): continue\n        if ('WINEPREFIX=' + prefix).encode() not in (p/'environ').read_bytes().split(b'\\0'): continue\n        maps = (p/'maps').read_text(errors='replace')\n        fex = bool(re.search(r'/FEX(?:Interpreter|Loader)?(?:\\s|$)|libFEX', maps, re.M))\n        box = bool(re.search(r'/box64(?:\\s|$)', maps, re.M))\n        actual = 'fex' if fex else 'box64' if box else None\n        if actual:\n            seen.append((p.name, actual))\n            if actual != expected: wrong.append((p.name, actual))\n    except OSError: pass\nprint('Route audit: expected=', expected, 'observed=', seen, 'conflicts=', wrong)\nif not seen: print('No emulator mapping visible at this instant; route was not independently verified.')\nsys.exit(1 if wrong else 0)\n", 0o755)
 
-    stage(4, 'Create a pure win32 prefix and verify 32-bit execution')
+    stage(4, f'Create a {PREFIX_ARCH} prefix and verify 32-bit Windows execution')
     create_prefix(wine, prefix, state, save)
-    say('Prefix reports #arch=win32 and executed a 32-bit cmd.exe.', '32')
+    say(f'Prefix reports #arch={PREFIX_ARCH} and executed a 32-bit cmd.exe.', '32')
 
     stage(5, 'Expose the existing game to Wine')
     drive, game_win = map_drive(wine, prefix, source, aoc_rel)
@@ -945,7 +870,7 @@ def main():
         run(['update-desktop-database', APPS], check=False)
 
     helper = DATA / 'tools' / 'clear-directplay-conflict.sh'
-    atomic(helper, PORT_HELPER, 0o755)
+    atomic(helper, PORT_HELPER.replace('@PREFIX_Q@', shlex.quote(str(prefix))), 0o755)
 
     stage(8, 'Final checks')
     say('Each application can be opened for a real smoke test; close it normally afterwards.\n'
@@ -968,7 +893,7 @@ def main():
             checks['voobly'] = 'FAILED'; logging.exception('Smoke test voobly'); say(str(e), '31')
 
     if helper.is_file():
-        run([str(helper), '--auto'], env=wine_env(prefix), check=False)
+        run([str(helper), '--check'], env=wine_env(prefix), check=False)
     port = run(['ss', '-H', '-lntup', 'sport = :47624'], check=False) if shutil.which('ss') else (0, '')
     z_path = 'Z:' + str(source).replace('/', '\\')
     summary = {
@@ -976,7 +901,9 @@ def main():
         'wine_version': version,
         'wine_binary': str(runner / 'bin/wine'),
         'wine_wrapper': str(wine),
-        'execution': f'FEX ({fex})' if fex else 'native x86',
+        'execution': f'{ROUTE} ({fex})' if fex else 'native x86',
+        'wine_archive_sha256': WINE_SHA256,
+        'distribution_family': distro_family(),
         'prefix': str(prefix),
         'prefix_architecture': prefix_arch(prefix),
         'original_game': str(source),
@@ -1004,15 +931,15 @@ def main():
         '• Launch Voobly, run Game Diagnostics, and set Installation directory ' + drive + '\\ and\n'
         '  Executable ' + game_win + '.\n'
         '• If Voobly does not list that drive, use Z: instead: ' + z_path + '\n'
-        '• Let Game Diagnostics apply its supported patch (v1.5 RC) instead of importing guessed keys.\n'
-        '• In room settings use 32-bit color, window mode, no virtual desktop; pass -nostartup to the game.\n'
+        '• Validate v1.5 RC first; then test the matched v1.6 RC + v1.6 Game Data pair separately.\n'
+        '• Preserve working graphics/media settings; pass -nostartup to the game if needed.\n'
         '• If multiplayer drops back to the connection screen, a stale DirectPlay helper may hold\n'
-        '  port 47624. The launchers clear it automatically before starting; run ' + str(helper) + '\n'
-        '  to do the same manually, and never kill every dplaysvr.exe.\n'
+        '  port 47624. The launchers report occupied ports without killing processes; run ' + str(helper) + '\n'
+        '  to inspect and explicitly terminate a confirmed leftover helper.\n'
         '• Do not kill every dplaysvr.exe or change DirectPlay repeatedly; a helper owning 47624 during a\n'
         '  match is normal.\n'
         '• Complete a real two-player match, then back up the working prefix and game directory.\n'
-        'Original game files and system Wine have not been replaced.')
+        'No game reinstall or global Wine replacement was performed; Voobly may update shared game files.')
     say(f'\nMachine-readable report: {report}\nFull command log: {LOG}', '36')
 
 
