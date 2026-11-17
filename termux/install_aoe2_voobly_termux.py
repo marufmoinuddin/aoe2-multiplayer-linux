@@ -419,8 +419,11 @@ def android_sdk():
 
 def preflight():
     if sys.version_info < (3, 9): raise RuntimeError('Python 3.9+ is required (pkg install python).')
-    if sys.platform != 'linux' or not (TERMUX / 'bin/pkg').exists():
-        raise RuntimeError('Run this inside Termux (F-Droid or GitHub build), not a generic shell.')
+    # Python 3.13+ on Android reports sys.platform == 'android' (PEP 738); older Termux
+    # pythons report 'linux'. Termux itself is identified by its pkg, not by the platform string.
+    if sys.platform not in ('linux', 'android') or not (TERMUX / 'bin/pkg').exists():
+        raise RuntimeError('Run this inside Termux (F-Droid or GitHub build), not a generic shell '
+                           f'(sys.platform={sys.platform!r}, no pkg at {TERMUX / "bin/pkg"}).')
     if os.geteuid() == 0: raise RuntimeError('Run as the Termux user, not root.')
     if platform.machine().lower() not in ('aarch64', 'arm64'):
         raise RuntimeError('This port needs an arm64-v8a device (Box64 emulates x86_64 on AArch64).')
