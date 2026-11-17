@@ -18,6 +18,12 @@ fontconfig / gnutls with their dependency closure) are fetched as prebuilt
 AlmaLinux 9 RPMs. File names and SHA256 sums come from the signed-by-TLS repo
 metadata, and the RPMs are unpacked user-locally. Nothing is compiled.
 
+Because the runner is a plain glibc build, wineserver would keep its socket
+directory in /tmp, which Android does not allow. Two format strings in
+bin/wineserver and */ntdll.so are rewritten in place (same conversions, same or
+shorter length) so the socket directory lives in the prefix, exactly like
+upstream's own __ANDROID__ branch. The archive SHA256 is verified first.
+
 FEX: its maintainers state Wine does not work under FEX on Termux (Android
 seccomp). --route fex exists for experimentation only and needs --emulator.
 
@@ -954,6 +960,39 @@ def cached_wine_archive():
     return None
 
 
+# Wine is a plain glibc build, so wineserver keeps its socket directory in /tmp
+# (upstream only uses $WINEPREFIX/.wineserver when compiled for Android) and
+# /tmp is not writable on Android. The two hardcoded format strings are rewritten
+# in place to a prefix-relative name: same conversions, same length or shorter,
+# so no ELF relocation is needed and only these bytes change.
+WINE_SRV_PATCHES = (
+    (b'/tmp/.wine-%u/server-%llx-%llx', b'.wine-srv-%u/server-%llx-%llx'),
+    (b'/tmp/.wine-%u', b'.wine-srv-%u'),
+)
+
+
+def patch_wine_server_dir(runner):
+    """Move wineserver's socket directory from /tmp into the Wine prefix."""
+    patched = False
+    targets = [runner / 'bin/wineserver', *sorted((runner / 'lib/wine').glob('*-unix/ntdll.so'))]
+    for path in targets:
+        if not path.is_file(): continue
+        data = original = path.read_bytes()
+        for old, new in WINE_SRV_PATCHES:
+            data = data.replace(old, new.ljust(len(old), b'\0'))
+        if data == original: continue
+        if b'/tmp/.wine-' in data:
+            raise RuntimeError(f'Unrecognised Wine build: {path} still points the wineserver '
+                               'socket at /tmp. Report the runner version.')
+        tmp = path.with_name(path.name + '.patched')
+        tmp.write_bytes(data)
+        os.chmod(tmp, path.stat().st_mode & 0o7777)
+        os.replace(tmp, path)
+        logging.info('Patched %s: wineserver socket dir is now prefix-relative', path)
+        patched = True
+    return patched
+
+
 def install_runner():
     runner = runner_path()
     if not (runner / '.complete').exists():
@@ -972,6 +1011,9 @@ def install_runner():
         target = runner / 'bin' / name
         if not target.is_file() or elf_machine(target.resolve()) != 62:
             raise RuntimeError(f'Wrong ELF architecture or missing runner component: {target}')
+    if patch_wine_server_dir(runner):
+        say('  Wine patched for Android: the wineserver socket directory lives in the '
+            'prefix, not in the read-only /tmp.', '2')
     return runner
 
 
@@ -997,10 +1039,22 @@ def check_wine_version(wine, prefix):
     return version
 
 
+def interrupted_prefix_entries(prefix):
+    """Entries an interrupted `wineboot --init` leaves behind (e.g. it failed at
+    the wineserver socket); reusing them is safe, anything else is foreign."""
+    known = {'dosdevices', 'drive_c', '.update-timestamp'}
+    if not prefix.is_dir(): return []
+    return sorted(p.name for p in prefix.iterdir()
+                  if p.name not in known and not p.name.startswith('.wine-srv-'))
+
+
 def create_prefix(wine, prefix, state, save):
     fresh = not (prefix / 'system.reg').exists()
-    if fresh and prefix.exists() and any(prefix.iterdir()):
-        raise RuntimeError('Prefix directory is nonempty and is not a managed Wine prefix.')
+    if fresh:
+        foreign = interrupted_prefix_entries(prefix)
+        if foreign:
+            raise RuntimeError('Prefix directory is nonempty and is not a managed Wine prefix: '
+                               + ', '.join(foreign))
     prefix.mkdir(parents=True, exist_ok=True)
     if fresh:
         run([wine, 'wineboot', '--init'], env=wine_env(prefix), timeout=900)
@@ -1508,8 +1562,8 @@ def main():
     statefile = DATA / 'installs' / (ident + '.json')
     state = json.loads(statefile.read_text()) if statefile.exists() else {'id': ident, 'source': str(source)}
     if state['source'] != str(source): raise RuntimeError('This prefix is registered to a different source; select a new prefix.')
-    if (prefix.exists() and any(prefix.iterdir()) and not statefile.exists()
-            and not str(prefix).startswith(str(DATA) + os.sep)):
+    if (not statefile.exists() and not str(prefix).startswith(str(DATA) + os.sep)
+            and interrupted_prefix_entries(prefix)):
         raise RuntimeError('Nonempty unmanaged prefix: refusing to mutate it. Choose a new empty prefix.')
     state.update(route=ROUTE, prefix_architecture=PREFIX_ARCH, renderer=RENDERER)
     say(f'\nHost: android/{platform.machine().lower()} (Termux, native)\nOriginal: {source}\n'
@@ -1638,6 +1692,7 @@ def main():
         'host': f'android/{platform.machine().lower()} (Termux native, no proot)',
         'wine_version': version, 'wine_binary': str(runner / 'bin/wine'), 'wine_wrapper': str(wine),
         'execution': f'{ROUTE} ({" ".join(EMU_CMD)})', 'wine_archive_sha256': WINE_SHA256,
+        'wine_patch': 'wineserver socket dir moved from /tmp into the prefix',
         'x86_64_libraries': str(X64LIBS), 'renderer': RENDERER,
         'prefix': str(prefix), 'prefix_architecture': prefix_arch(prefix),
         'original_game': str(source), 'game_drive': f'{drive} (original directory, not a copy)',
