@@ -11,6 +11,7 @@ Usage:
     ./uninstall_aoe2_voobly.py                  interactive removal
     ./uninstall_aoe2_voobly.py --dry-run        show what would be removed
     ./uninstall_aoe2_voobly.py --purge-backups  also remove game-dir backups
+    ./uninstall_aoe2_voobly.py --purge-legacy   also remove the previous aoe2-voobly data
 """
 from __future__ import annotations
 
@@ -25,13 +26,17 @@ import time
 from pathlib import Path
 
 HOME = Path.home()
-DATA = Path(os.environ.get('XDG_DATA_HOME', HOME / '.local/share')) / 'aoe2-voobly'
-CACHE = Path(os.environ.get('XDG_CACHE_HOME', HOME / '.cache')) / 'aoe2-voobly'
+DATA = Path(os.environ.get('XDG_DATA_HOME', HOME / '.local/share')) / 'aoe2-multiplayer-linux'
+CACHE = Path(os.environ.get('XDG_CACHE_HOME', HOME / '.cache')) / 'aoe2-multiplayer-linux'
+# The previous aoe2-voobly layout is only touched when explicitly requested.
+LEGACY_DATA = Path(os.environ.get('XDG_DATA_HOME', HOME / '.local/share')) / 'aoe2-voobly'
+LEGACY_CACHE = Path(os.environ.get('XDG_CACHE_HOME', HOME / '.cache')) / 'aoe2-voobly'
 APPS = DATA.parent / 'applications'
 ICON_ROOT = DATA.parent / 'icons'
 COLOR = sys.stdout.isatty() and not os.environ.get('NO_COLOR')
 DRY = '--dry-run' in sys.argv[1:]
 PURGE_BACKUPS = '--purge-backups' in sys.argv[1:]
+PURGE_LEGACY = '--purge-legacy' in sys.argv[1:]
 
 removed = []
 
@@ -246,9 +251,19 @@ def show(label, paths, size=None):
         say(f'    {p}')
 
 
+def attach_terminal():
+    """`curl ... | python3` makes stdin the script; prompts need the terminal."""
+    try:
+        if sys.stdin is None or not sys.stdin.isatty():
+            sys.stdin = open('/dev/tty', 'r', encoding='utf-8', errors='replace')
+    except OSError:
+        pass
+
+
 def main():
     if sys.platform != 'linux':
         raise RuntimeError('This utility supports Linux only.')
+    attach_terminal()
     if os.geteuid() == 0:
         raise RuntimeError('Run as your desktop user, not root or sudo.')
     lock = installer_lock()
@@ -263,17 +278,19 @@ def main():
     icons = sorted(ICON_ROOT.glob('hicolor/*/apps/aoe2-voobly-*')) if ICON_ROOT.is_dir() else []
     backups = game_backups(states)
     managed = [p for p in (DATA, CACHE) if p.exists()]
+    legacy = [p for p in (LEGACY_DATA, LEGACY_CACHE) if p.exists()]
 
     say('\nInventory of installer-managed files:')
     show('Wine prefix(es)', prefixes)
-    show('Installer data (runner, launchers, tools, state, logs, prefix backups)', [DATA] if DATA.exists() else [],
+    show('Installer data (runner, translator/box64, launchers, tools, state, logs)', [DATA] if DATA.exists() else [],
          tree_size(DATA) if DATA.exists() else 0)
     show('Download cache', [CACHE] if CACHE.exists() else [], tree_size(CACHE) if CACHE.exists() else 0)
     show('Desktop entries', desktops)
     show('Icons', icons)
     show('Game directory backups (kept unless purged)', backups)
+    show('Previous aoe2-voobly layout (optional, kept unless purged)', legacy)
 
-    if not prefixes and not desktops and not icons and not managed:
+    if not prefixes and not desktops and not icons and not managed and not legacy:
         say('\nNothing to remove. The installation is already gone.', '32')
         return
 
@@ -291,6 +308,10 @@ def main():
     purge = PURGE_BACKUPS
     if backups and not purge and not DRY:
         purge = yes('Also remove the game directory backups listed above?', False)
+
+    purge_legacy = PURGE_LEGACY
+    if legacy and not purge_legacy and not DRY:
+        purge_legacy = yes('Also remove the previous aoe2-voobly data (old layout)?', False)
 
     for prefix in prefixes:
         say(f'\nPrefix: {prefix}')
@@ -315,6 +336,16 @@ def main():
         for path in backups:
             drop(path, 'game backup')
 
+    if purge_legacy:
+        say('\nPrevious layout:')
+        for path in legacy:
+            if not DRY:
+                for proc_prefix in (LEGACY_DATA / 'prefix', LEGACY_DATA / 'routes' / 'wow64' / 'prefix',
+                                    LEGACY_DATA / 'routes' / 'box64-wow64' / 'prefix'):
+                    if proc_prefix.is_dir():
+                        stop_prefix_processes(proc_prefix)
+            drop(path, 'previous layout data')
+
     if not DRY and shutil.which('update-desktop-database') and (desktops or icons):
         from subprocess import run as sp_run
         sp_run(['update-desktop-database', str(APPS)], check=False)
@@ -326,14 +357,19 @@ def main():
     say('Kept: Voobly setup executable and system Wine.', '32')
     if backups and not purge:
         say('Kept: game directory backups (rerun with --purge-backups to remove).', '33')
+    if legacy and not purge_legacy:
+        say('Kept: previous aoe2-voobly data (rerun with --purge-legacy to remove).', '33')
     say('\nUninstall complete.' if not DRY else 'Dry run complete.', '1;32')
 
 
 if __name__ == '__main__':
-    unknown = [a for a in sys.argv[1:] if a not in ('--dry-run', '--purge-backups')]
+    if {'-h', '--help'} & set(sys.argv[1:]):
+        print(__doc__.strip())
+        sys.exit(0)
+    unknown = [a for a in sys.argv[1:] if a not in ('--dry-run', '--purge-backups', '--purge-legacy')]
     if unknown:
         print(f'Unknown argument(s): {" ".join(unknown)}', file=sys.stderr)
-        print('Usage: uninstall_aoe2_voobly.py [--dry-run] [--purge-backups]', file=sys.stderr)
+        print('Usage: uninstall_aoe2_voobly.py [--dry-run] [--purge-backups] [--purge-legacy]', file=sys.stderr)
         sys.exit(2)
     try:
         main()

@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """AoE II Classic + Voobly installer: native x86, ARM64 FEX, or ARM64 Box64.
 
-Prebuilt only. ARM64 users select FEX + Wine 10.0 x86/win32 or
-Box64 + Wine 10.0 amd64-wow64/win64. Each route has separate state,
-runners, prefixes, wrappers and logs below XDG_DATA_HOME/aoe2-voobly/routes.
-No existing environment is migrated. Existing game files are shared read-write.
+Prebuilt only. ARM64 users select FEX or Box64; both run Wine 10.0
+amd64-wow64 against ONE shared win64 prefix under
+XDG_DATA_HOME/aoe2-multiplayer-linux (prefix, runner, tools, state and logs
+live directly there, and box64 is kept under translator/), so the emulator can
+be switched by rerunning and picking the other route. FEX stays system-provided.
+Earlier layouts are adopted in place on first run. Existing game files are
+shared read-write.
 
 Package adapters: Debian/Ubuntu (apt), Fedora/RHEL family (dnf/yum),
 Arch family (pacman). Repository availability and native library support vary;
@@ -39,13 +42,19 @@ from pathlib import Path
 
 HOME = Path.home()
 DATA_HOME = Path(os.environ.get('XDG_DATA_HOME', HOME / '.local/share')).expanduser().absolute()
-BASE_DATA = DATA_HOME / 'aoe2-voobly'
+BASE_DATA = DATA_HOME / 'aoe2-multiplayer-linux'
 DATA = BASE_DATA
-BASE_CACHE = Path(os.environ.get('XDG_CACHE_HOME', HOME / '.cache')).expanduser().absolute() / 'aoe2-voobly'
+_CACHE_HOME = Path(os.environ.get('XDG_CACHE_HOME', HOME / '.cache')).expanduser().absolute()
+BASE_CACHE = _CACHE_HOME / 'aoe2-multiplayer-linux'
 CACHE = BASE_CACHE
+# Previous layouts are only read to adopt existing files in place.
+LEGACY_DATA = DATA_HOME / 'aoe2-voobly'
+LEGACY_CACHE = _CACHE_HOME / 'aoe2-voobly'
+TRANSLATOR = BASE_DATA / 'translator'
 APPS = DATA_HOME / 'applications'
 ICONS = DATA_HOME / 'icons/hicolor/256x256/apps'
 COLOR = sys.stdout.isatty() and not os.environ.get('NO_COLOR')
+SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 STAMP = dt.datetime.now().strftime('%Y%m%d-%H%M%S')
 LOG = DATA / 'logs' / (STAMP + '.log')
 
@@ -53,20 +62,64 @@ WINE_VERSION = '10.0'
 WINE_ARCHIVE = f'wine-{WINE_VERSION}-x86.tar.xz'
 WINE_SHA256 = 'c5be273749f5c513b3edf7ad79d8214be558b80c67c6ca343d2f17fdcc30c2d2'
 WINE_URL = f'https://github.com/Kron4ek/Wine-Builds/releases/download/{WINE_VERSION}/{WINE_ARCHIVE}'
+WINE_FLAVOR = 'x86'
+# Box64 does not wrap libgcc_s.so.1 and Fedora ships no x86_64 libraries, so Wine's
+# ntdll.so cannot load without an emulated x86_64 copy. Pinned prebuilt, extracted
+# user-local under the route workspace; never installed system-wide.
+X64LIB_RPM = 'libgcc-11.5.0-17.el9_9.alma.1.x86_64.rpm'
+X64LIB_URL = f'https://repo.almalinux.org/almalinux/9/BaseOS/x86_64/os/Packages/{X64LIB_RPM}'
+X64LIB_SHA256 = '1248acf03287807e448174d8753b7b8a9b2cc46f40f237281c91f20fa2339386'
+# Box64 wraps these natively ("essential_libs" in src/librarian/library.c); every
+# other dependency must exist as an emulated x86_64 library.
+BOX64_WRAPPED = frozenset('''libc.so.6 libpthread.so.0 librt.so.1 libGL.so.1 libGL.so libX11.so.6
+libasound.so.2 libdl.so.2 libm.so.6 libbsd.so.0 libutil.so.1 libresolv.so.2 libresolv.so
+libXxf86vm.so.1 libXinerama.so.1 libXrandr.so.2 libXext.so.6 libXfixes.so.3 libXcursor.so.1
+libXrender.so.1 libXft.so.2 libXi.so.6 libXss.so.1 libXpm.so.4 libXau.so.6 libXdmcp.so.6
+libX11-xcb.so.1 libxcb.so.1 libxcb-xfixes.so.0 libxcb-shape.so.0 libxcb-shm.so.0 libxcb-randr.so.0
+libxcb-image.so.0 libxcb-keysyms.so.1 libxcb-xtest.so.0 libxcb-glx.so.0 libxcb-dri2.so.0 libxcb-dri3.so.0
+libXtst.so.6 libXt.so.6 libXcomposite.so.1 libXdamage.so.1 libXmu.so.6 libxkbcommon.so.0
+libxkbcommon-x11.so.0 libpulse-simple.so.0 libpulse.so.0 libvulkan.so.1 libvulkan.so
+ld-linux-x86-64.so.2 crashhandler.so libtcmalloc_minimal.so.0 libtcmalloc_minimal.so.4 libanl.so.1'''.split())
 TOTAL_STAGES = 8
 ROUTE = 'native'
 PREFIX_ARCH = 'win32'
 EMULATOR = None
 OPTIONS = None
+VERBOSE = False
 DIRECTPLAY_FILES = ('dplayx.dll', 'dpnet.dll', 'dpnhpast.dll', 'dpwsockx.dll')
+# Winetricks' directplay verb needs the Feb 2010 DirectX redist, which it fetches
+# from a single web.archive.org snapshot that often returns 503/404. We seed its
+# cache from mirrors first (same pinned SHA256 as winetricks) and retry.
+DIRECTX_REDIST_NAME = 'directx_feb2010_redist.exe'
+DIRECTX_REDIST_SHA256 = 'f6d191e89a963d7cca34f169d30f49eab99c1ed3bb92da73ec43617caaa1e93f'
+DIRECTX_REDIST_MIRRORS = (
+    'https://files.holarse-linuxgaming.de/mirrors/microsoft/directx_feb2010_redist.exe',
+    'https://web.archive.org/web/20100205000000id_/https://download.microsoft.com/download/E/E/1/EE17FF74-6C45-4575-9CF4-7FC2597ACD18/directx_feb2010_redist.exe',
+    'https://web.archive.org/web/20101224202650id_/http://download.microsoft.com/download/E/E/1/EE17FF74-6C45-4575-9CF4-7FC2597ACD18/directx_feb2010_redist.exe',
+    'https://web.archive.org/web/2016id_/https://download.microsoft.com/download/E/E/1/EE17FF74-6C45-4575-9CF4-7FC2597ACD18/directx_feb2010_redist.exe',
+)
 
 
 def say(text, color='36'):
     print(('\033[' + color + 'm' + text + '\033[0m') if COLOR else text, flush=True)
 
 
+def bar(fraction, width=26, full='█', empty='░'):
+    filled = max(0, min(width, int(round(fraction * width))))
+    return full * filled + empty * (width - filled)
+
+
+def human_size(n):
+    return f'{n / 1048576:.0f} MiB' if n >= 1024 * 1024 else f'{max(1, round(n / 1024))} KiB'
+
+
 def ask(text, default=''):
-    value = input(f'{text}' + (f' [{default}]' if default else '') + ': ').strip()
+    if COLOR:
+        prompt = f'\033[1;36m❯\033[0m {text}'
+        if default: prompt += f' \033[2m[{default}]\033[0m'
+    else:
+        prompt = text + (f' [{default}]' if default else '')
+    value = input(prompt + ': ').strip()
     return value or str(default)
 
 
@@ -75,26 +128,40 @@ def yes(text, default=False):
 
 
 def stage(n, text):
-    say(f'\n  [{n}/{TOTAL_STAGES}]  {text}\n' + '─' * 64, '1;36')
+    dots = ' '.join('●' if i < n else ('▶' if i == n else '○') for i in range(1, TOTAL_STAGES + 1))
+    inner = f'[{n}/{TOTAL_STAGES}]  {text}'
+    if not COLOR:
+        say(f'\n  {inner}')
+        say('  ' + '─' * 66)
+        return
+    width = max(66, len(inner) + len(dots) + 4)
+    say('\n  ╭' + '─' * width + '╮', '1;36')
+    say('  │ ' + inner + ' ' * (width - len(inner) - len(dots) - 2) + dots + ' │', '1;36')
+    say('  ╰' + '─' * width + '╯', '1;36')
 
 
 def run(argv, env=None, cwd=None, timeout=180, check=True):
     argv = [str(x) for x in argv]
     logging.info('RUN %s cwd=%s', shlex.join(argv), cwd)
+    if VERBOSE:
+        say(f'  $ {shlex.join(argv)}', '2')
     with tempfile.TemporaryFile(mode='w+') as output:
         proc = sp.Popen(argv, env=env, cwd=cwd, stdout=output, stderr=sp.STDOUT,
                         start_new_session=True)
         start = time.monotonic()
-        frames = '|/-\\'
+        label = shlex.join(argv)
+        label = '…' + label[-44:] if len(label) > 45 else label
+        frames = SPINNER
         i = 0
         try:
             while proc.poll() is None:
                 if timeout and time.monotonic() - start > timeout:
                     raise RuntimeError(f'Timed out: {shlex.join(argv)}. Wine children may still be running; inspect the log.')
                 if sys.stdout.isatty():
-                    print(f'\r  {frames[i % 4]} Working… {int(time.monotonic()-start)}s', end='', flush=True)
+                    spun = frames[i % len(frames)] if COLOR else '|/-\\'[i % 4]
+                    print(f'\r\033[K  {spun} {label:<45} {int(time.monotonic()-start):>3}s', end='', flush=True)
                 i += 1
-                time.sleep(.15)
+                time.sleep(.12)
         except BaseException:
             # Ctrl+C and timeouts must not leave the Wine application running.
             if proc.poll() is None:
@@ -112,10 +179,17 @@ def run(argv, env=None, cwd=None, timeout=180, check=True):
                     proc.wait()
             raise
         if sys.stdout.isatty():
-            print('\r' + ' ' * 60 + '\r', end='')
+            print('\r\033[K', end='', flush=True)
         output.seek(0)
         text = output.read()
     logging.info('EXIT %s\n%s', proc.returncode, text)
+    if VERBOSE:
+        lines = text.rstrip('\n').splitlines()
+        for line in lines[:400]:
+            say(f'    | {line}', '2')
+        if len(lines) > 400:
+            say(f'    | ... {len(lines) - 400} more line(s), see the log', '2')
+        say(f'    exit {proc.returncode}', '2')
     if check and proc.returncode:
         raise RuntimeError(f'Command exited {proc.returncode}: {shlex.join(argv)}\n{text[-3500:]}')
     return proc.returncode, text
@@ -134,6 +208,8 @@ def download(url, target, digest=None):
 
     if target.exists() and digest and checksum(target) == digest:
         return target
+    if VERBOSE:
+        say(f'  GET {url}', '2')
     temp = target.with_suffix(target.suffix + '.part')
     req = urllib.request.Request(url, headers={'User-Agent': 'AoE2-Voobly-Installer/2.0'})
     with urllib.request.urlopen(req, timeout=60) as response, temp.open('wb') as f:
@@ -142,15 +218,21 @@ def download(url, target, digest=None):
         while chunk := response.read(1024 * 512):
             f.write(chunk); done += len(chunk)
             if sys.stdout.isatty():
-                pct = f'{done / total:6.1%}' if total else f'{done // 1048576} MiB'
-                print(f'\r  Downloading {target.name}: {pct}', end='', flush=True)
-    print()
+                if total:
+                    print(f'\r  {bar(done / total)} {done / total:6.1%}  '
+                          f'{human_size(done)}/{human_size(total)}  {target.name[:28]}',
+                          end='', flush=True)
+                else:
+                    print(f'\r  {human_size(done)}  {target.name[:40]}', end='', flush=True)
+    if sys.stdout.isatty():
+        print('\r\033[K', end='', flush=True)
     actual = checksum(temp)
     logging.info('DOWNLOAD %s sha256=%s', url, actual)
     if digest and actual.lower() != digest.lower():
         temp.unlink()
         raise RuntimeError('SHA256 verification failed; archive was not executed.')
     temp.replace(target)
+    say(f'  ✔ {target.name} ({human_size(target.stat().st_size)}, SHA256 verified)', '32')
     return target
 
 
@@ -180,6 +262,48 @@ def elf_machine(path):
         return int.from_bytes(b[18:20], 'little' if b[5] == 1 else 'big')
     except OSError:
         return None
+
+
+def elf_needed(path):
+    """DT_NEEDED sonames of a 64-bit little-endian ELF, read from its section headers."""
+    try:
+        with Path(path).open('rb') as f:
+            if f.read(4) != b'\x7fELF': return []
+            f.seek(0)
+            hdr = f.read(64)
+            if len(hdr) < 64 or hdr[4] != 2 or hdr[5] != 1: return []
+            shoff = struct.unpack_from('<Q', hdr, 0x28)[0]
+            shentsize, shnum, shstrndx = struct.unpack_from('<HHH', hdr, 0x3a)
+            if not shoff or shentsize < 64 or not shnum or shstrndx >= shnum: return []
+            f.seek(shoff)
+            raw = f.read(shentsize * shnum)
+            shdrs = [struct.unpack_from('<IIQQQQIIQQ', raw, i * shentsize) for i in range(shnum)]
+            strtab = shdrs[shstrndx]
+            f.seek(strtab[4])
+            names = f.read(strtab[5])
+
+            def sname(offset):
+                end = names.find(b'\0', offset)
+                return names[offset:end].decode('ascii', 'replace')
+
+            dynamic = dynstr = None
+            for sh in shdrs:
+                title = sname(sh[0])
+                if title == '.dynamic' and sh[1] == 6: dynamic = (sh[4], sh[5])
+                elif title == '.dynstr' and sh[1] == 3: dynstr = (sh[4], sh[5])
+            if not dynamic or not dynstr: return []
+            f.seek(dynstr[0]); strings = f.read(dynstr[1])
+            f.seek(dynamic[0]); blob = f.read(dynamic[1])
+        needed = []
+        for off in range(0, len(blob) - 15, 16):
+            tag, val = struct.unpack_from('<QQ', blob, off)
+            if tag == 0: break
+            if tag == 1:  # DT_NEEDED
+                end = strings.find(b'\0', val)
+                if end != -1: needed.append(strings[val:end].decode('ascii', 'replace'))
+        return needed
+    except (OSError, struct.error, IndexError):
+        return []
 
 
 def find_ci(root, name):
@@ -273,12 +397,15 @@ def install_packages(packages, reason):
 
 
 def configure_route():
-    global DATA, CACHE, LOG, ROUTE, PREFIX_ARCH, OPTIONS
-    global WINE_ARCHIVE, WINE_SHA256, WINE_URL
-    parser = argparse.ArgumentParser(description='AoE II / Voobly: isolated native, FEX, or Box64 Wine routes. Prebuilt binaries only.')
+    global DATA, CACHE, LOG, ROUTE, PREFIX_ARCH, OPTIONS, VERBOSE
+    global WINE_ARCHIVE, WINE_SHA256, WINE_URL, WINE_FLAVOR
+    parser = argparse.ArgumentParser(description='AoE II / Voobly installer with FEX or Box64 emulation. Prebuilt binaries only.')
     parser.add_argument('--route', choices=('fex', 'box64', 'native'))
     parser.add_argument('--emulator', type=Path, help='Existing native ARM64 FEX or Box64 executable')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                        help='Show every command and its output while the stages run')
     OPTIONS = parser.parse_args()
+    VERBOSE = OPTIONS.verbose
     machine = platform.machine().lower()
     arm = machine in ('aarch64', 'arm64')
     if machine not in ('aarch64', 'arm64', 'x86_64', 'amd64', 'i386', 'i486', 'i586', 'i686', 'x86'):
@@ -287,9 +414,10 @@ def configure_route():
         route = OPTIONS.route
         if route == 'native': raise RuntimeError('Native x86 Wine is not an ARM64 route.')
         if not route:
-            say('ARM64 execution route:\n  1. FEX + Wine 10.0 x86 / win32 prefix\n'
+            say('ARM64 execution route (both share one win64 prefix; switch anytime by rerunning):\n'
+                '  1. FEX + Wine 10.0 amd64-wow64 / win64 prefix\n'
                 '  2. Box64 + Wine 10.0 amd64-wow64 / win64 prefix\n'
-                'Routes use separate runners, prefixes, wrappers, logs, and state.')
+                'Only the emulator, wrappers and launchers differ; runner, prefix, Voobly and state are shared.')
             choice = ask('Select 1/FEX or 2/Box64', '1').lower()
             if choice not in ('1', '2', 'fex', 'box64'):
                 raise RuntimeError('Invalid route selection.')
@@ -299,37 +427,212 @@ def configure_route():
         if route != 'native' or OPTIONS.emulator:
             raise RuntimeError('FEX/Box64 routes require an ARM64 host; use native on x86.')
     ROUTE = route
-    PREFIX_ARCH = 'win64' if route == 'box64' else 'win32'
-    label = route + ('-wow64' if route == 'box64' else '-win32')
-    DATA = BASE_DATA / 'routes' / label
-    CACHE = BASE_CACHE / label
+    if route in ('fex', 'box64'):
+        PREFIX_ARCH = 'win64'
+        flavor = 'amd64-wow64'
+        WINE_SHA256 = ('aeebbbf239e548f0136f1cd72a2e109dd9a572a8f703da3c09fa40d74d5c255f')
+    else:
+        PREFIX_ARCH = 'win32'
+        flavor = 'x86'
+        WINE_SHA256 = ('c5be273749f5c513b3edf7ad79d8214be558b80c67c6ca343d2f17fdcc30c2d2')
+    WINE_FLAVOR = flavor
+    DATA = BASE_DATA
+    CACHE = BASE_CACHE
+
+    def adopt(legacy, current):
+        """Move a previous workspace in place so nothing has to be re-downloaded."""
+        if not legacy.is_dir(): return
+        if current.exists() and any(current.iterdir()): return
+        current.parent.mkdir(parents=True, exist_ok=True)
+        if current.exists():
+            for item in legacy.iterdir():
+                target = current / item.name
+                if not target.exists():
+                    shutil.move(str(item), str(target))
+            legacy.rmdir()
+        else:
+            shutil.move(str(legacy), str(current))
+        say(f'Adopted previous files: {legacy} -> {current}', '32')
+
+    adopt(LEGACY_DATA / 'routes' / 'wow64', DATA)
+    adopt(LEGACY_DATA / 'routes' / 'box64-wow64', DATA)
+    adopt(LEGACY_CACHE / 'wow64', CACHE)
+    adopt(LEGACY_CACHE / 'box64-wow64', CACHE)
     LOG = DATA / 'logs' / (STAMP + '.log')
-    flavor = 'amd64-wow64' if route == 'box64' else 'x86'
     WINE_ARCHIVE = f'wine-{WINE_VERSION}-{flavor}.tar.xz'
-    WINE_SHA256 = ('aeebbbf239e548f0136f1cd72a2e109dd9a572a8f703da3c09fa40d74d5c255f'
-                   if route == 'box64' else
-                   'c5be273749f5c513b3edf7ad79d8214be558b80c67c6ca343d2f17fdcc30c2d2')
     WINE_URL = f'https://github.com/Kron4ek/Wine-Builds/releases/download/{WINE_VERSION}/{WINE_ARCHIVE}'
 
 
 def require_emulator():
     if ROUTE == 'native': return None
     name = 'FEX' if ROUTE == 'fex' else 'box64'
+    local = TRANSLATOR / 'box64' if ROUTE == 'box64' else None
     supplied = OPTIONS.emulator
-    found = supplied if supplied else shutil.which(name)
-    if not found:
-        install_packages(['fex-emu' if ROUTE == 'fex' else 'box64'], f'{name} is required for the selected route.')
+    if supplied:
+        found = supplied
+    elif local and local.is_file():
+        found = local
+    else:
         found = shutil.which(name)
+        if not found:
+            install_packages(['fex-emu' if ROUTE == 'fex' else 'box64'],
+                             f'{name} is required for the selected route.')
+            found = shutil.which(name)
     if not found or not Path(found).is_file() or not os.access(found, os.X_OK):
         raise RuntimeError(f'{name} executable missing. Install a prebuilt package or use --emulator /absolute/path.')
     resolved = Path(found).resolve()
     if elf_machine(resolved) != 183:
         raise RuntimeError(f'Expected a native AArch64 ELF emulator, not a script/foreign binary: {resolved}')
+    if local is not None and resolved != local.absolute():
+        # box64 lives with the rest of the install; FEX stays system-provided.
+        if not local.exists() or local.stat().st_mtime < resolved.stat().st_mtime:
+            local.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(resolved, local)
+            local.chmod(0o755)
+            say(f'box64 stored in {local}', '32')
+        resolved = local.absolute()
     if ROUTE == 'fex':
         say('FEX RootFS must already be configured. Its location is not assumed.\n'
             'The actual Wine execution probe will verify that configuration.\n'
             'If needed, use your distribution FEX RootFS package or upstream FEXRootFSFetcher.', '33')
     return resolved
+
+
+def box64_libdir():
+    found = next(iter(find_ci(TRANSLATOR / 'x64libs', 'libgcc_s.so.1')), None)
+    return found.parent if found else TRANSLATOR / 'x64libs' / 'lib64'
+
+
+def box64_ld_library_path():
+    if ROUTE != 'box64': return ''
+    parts = [str(box64_libdir())]
+    unix = DATA / 'runners' / f'wine-{WINE_VERSION}-amd64-wow64' / 'lib/wine/x86_64-unix'
+    if unix.is_dir(): parts.append(str(unix))
+    return ':'.join(parts)
+
+
+def x64_lib_present(name):
+    dirs = [box64_libdir(), Path('/usr/lib/box64-x86_64-linux-gnu'), Path('/lib/box64-x86_64-linux-gnu'),
+            Path('/usr/lib/x86_64-linux-gnu'), Path('/lib/x86_64-linux-gnu'),
+            Path('/usr/lib64'), Path('/lib64'), Path('/usr/lib'), Path('/lib')]
+    for d in dirs:
+        p = d / name
+        try:
+            if p.exists() and elf_machine(p.resolve()) == 62: return True
+        except (OSError, RuntimeError):
+            continue
+    return False
+
+
+def box64_start_libs(runner):
+    """Non-wrapped libraries the Wine startup chain hard-requires as x86_64."""
+    root = runner / 'lib/wine'
+    internal = {p.name for p in root.rglob('*.so')}
+    needed = set()
+    for target in (runner / 'bin/wine', runner / 'bin/wineserver',
+                   root / 'x86_64-unix/ntdll.so', root / 'x86_64-unix/win32u.so'):
+        if not target.is_file(): continue
+        for name in elf_needed(target):
+            if name not in BOX64_WRAPPED and name not in internal:
+                needed.add(name)
+    return sorted(needed)
+
+
+def ensure_box64_x64libs(runner):
+    (TRANSLATOR / 'x64libs').mkdir(parents=True, exist_ok=True)
+    missing = [n for n in box64_start_libs(runner) if not x64_lib_present(n)]
+    if not missing:
+        say('Box64 x86_64 startup libraries already available: ' + ', '.join(box64_start_libs(runner)), '32')
+    else:
+        unsupported = [n for n in missing if n != 'libgcc_s.so.1']
+        if unsupported or package_manager() not in ('dnf', 'yum'):
+            raise RuntimeError('Box64 needs emulated x86_64 libraries not present here: ' + ', '.join(missing) +
+                               '. Provision them with the Box64 x86 library bundle (box64-data provides '
+                               'box64-bundle-x86-libs.sh) or as x86_64 packages, then rerun. '
+                               'No repositories were added and nothing was compiled.')
+        if not shutil.which('rpm2cpio'):
+            raise RuntimeError('rpm2cpio is required to extract the prebuilt libgcc package; '
+                               'install your rpm package and rerun.')
+        if not shutil.which('cpio'):
+            install_packages(['cpio'], 'cpio is required to extract the prebuilt libgcc package.')
+        say(f'Missing for Box64: {", ".join(missing)} — provisioning a pinned prebuilt x86_64 libgcc.', '33')
+        rpm = download(X64LIB_URL, CACHE / X64LIB_RPM, X64LIB_SHA256)
+        run(['bash', '-c', 'cd "$1" && rpm2cpio "$2" | cpio -idm --quiet', 'x', str(TRANSLATOR / 'x64libs'), str(rpm)],
+            timeout=300)
+        still = [n for n in box64_start_libs(runner) if not x64_lib_present(n)]
+        if still:
+            raise RuntimeError('x86_64 startup libraries still missing after extraction: ' + ', '.join(still))
+        say(f'x86_64 {", ".join(box64_start_libs(runner))} ready under {box64_libdir()}.', '32')
+    late = sorted({n for p in (runner / 'lib/wine/x86_64-unix').glob('*.so')
+                   for n in elf_needed(p) if n not in BOX64_WRAPPED and not x64_lib_present(n)})
+    if late:
+        say('Not needed for startup, but some Wine drivers may later report "Error loading needed lib X" '
+            'for: ' + ', '.join(late) + '. Provision the matching x86_64 libraries with '
+            'box64-bundle-x86-libs.sh if that happens.', '33')
+
+
+def reuse_or_replace(prefix, statefile, ident, source):
+    """Reuse an existing route installation by default, or replace it on request.
+
+    Returns fresh state when a replacement was performed, else None.
+    """
+    runner_dir = runner_path()
+    existing = [label for label, present in (
+        ('prefix', (prefix / 'system.reg').is_file()),
+        ('state', statefile.is_file()),
+        ('runner', (runner_dir / '.complete').is_file())) if present]
+    if not existing: return None
+    say('\nExisting installation for this prefix: ' + ', '.join(existing))
+    if not yes('Replace the previous prefix/install? The default reuses everything already present.', False):
+        say('Reusing the existing installation; completed stages are skipped and '
+            'nothing already present is re-downloaded.', '32')
+        return None
+    stop_route_processes(prefix)
+    if prefix.exists():
+        shutil.rmtree(prefix); say(f'Removed prefix: {prefix}', '33')
+    if statefile.exists():
+        statefile.unlink(); say(f'Removed state: {statefile.name}', '33')
+    if (DATA / 'tools' / 'voobly-client-path').exists():
+        (DATA / 'tools' / 'voobly-client-path').unlink()
+    if runner_dir.exists() and not (runner_dir / '.complete').exists():
+        shutil.rmtree(runner_dir); say('Removed the incomplete runner; it will be fetched again.', '33')
+    say('Replaced. The verified runner and downloads are kept; stages rerun on a clean prefix.', '32')
+    return {'id': ident, 'source': str(source), 'route': ROUTE, 'prefix_architecture': PREFIX_ARCH}
+
+
+def stop_route_processes(prefix):
+    needle = ('WINEPREFIX=' + str(prefix)).encode()
+
+    def current():
+        hits = []
+        for proc in Path('/proc').glob('[0-9]*'):
+            try:
+                if proc.stat().st_uid != os.getuid(): continue
+                if needle not in (proc / 'environ').read_bytes().split(b'\0'): continue
+                hits.append((int(proc.name), (proc / 'comm').read_text().strip()))
+            except OSError:
+                continue
+        return hits
+
+    hits = current()
+    if not hits: return
+    say('Running processes for this prefix: ' + ', '.join(f'{p} ({c})' for p, c in hits), '33')
+    server = DATA / 'bin' / 'wineserver'
+    if server.is_file():
+        run([server, '-k'], env=wine_env(prefix), timeout=30, check=False)
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline and current():
+        time.sleep(0.5)
+    for pid, _ in current():
+        try: os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError: pass
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and current():
+        time.sleep(0.5)
+    left = current()
+    if left:
+        raise RuntimeError('Close these running applications and rerun: '
+                           + ', '.join(f'{p} ({c})' for p, c in left))
 
 
 def windows32_dir(prefix):
@@ -397,6 +700,8 @@ def tools():
         package_commands.update(ss='iproute', ps='procps-ng', xz='xz')
     elif family == 'arch':
         package_commands.update(ps='procps-ng', xz='xz')
+    if ROUTE == 'box64' and family == 'redhat':
+        package_commands.update(cpio='cpio', rpm2cpio='rpm')
     missing = [c for c in package_commands if not shutil.which(c)]
     if missing:
         install_packages(sorted({package_commands[c] for c in missing}),
@@ -420,20 +725,24 @@ def wine_env(prefix, extra=None):
     if ROUTE == 'box64':
         env['BOX64_PATH'] = str(DATA / 'bin') + ':' + str(DATA / 'runners' / f'wine-{WINE_VERSION}-amd64-wow64/bin')
         env['BOX64_NOBANNER'] = '1'
+        env['BOX64_LD_LIBRARY_PATH'] = box64_ld_library_path()
     if extra: env.update(extra)
     return env
 
 
-WRAPPER_TEMPLATE = '#!/usr/bin/env bash\nset -uo pipefail\nRUNNER=@RUNNER_Q@\nBIN=@BIN_Q@\nROUTE=@ROUTE_Q@\nEMULATOR=@EMU_Q@\nPREFIX_ARCH=@ARCH_Q@\nPREFIX_DEFAULT=@PREFIX_Q@\nNAME="${0##*/}"\ncase "$NAME" in wine|wineserver) ;; *) exit 2;; esac\nunset WINE64 WINELOADER WINEDLLPATH LD_PRELOAD LD_LIBRARY_PATH\nunset WINE_DISABLE_FULLSCREEN_HACK STAGING_WRITECOPY\nexport WINE="$BIN/wine" WINESERVER="$BIN/wineserver"\nexport WINEPREFIX="${WINEPREFIX:-$PREFIX_DEFAULT}"\nexport WINEARCH="$PREFIX_ARCH"\nexport PATH="$BIN:$RUNNER/bin:$PATH"\nexport WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-winemenubuilder.exe=d}"\nif [[ "$ROUTE" == box64 ]]; then\n    export BOX64_PATH="$BIN:$RUNNER/bin"\n    export BOX64_NOBANNER=1\nfi\ncmd=("$RUNNER/bin/$NAME")\n[[ "$ROUTE" == native ]] || cmd=("$EMULATOR" "${cmd[@]}")\nif [[ "$NAME" == wine && "${1:-}" == --version ]]; then\n    tmp="$(mktemp)" || exit 1\n    trap \'rm -f -- "$tmp"\' EXIT\n    "${cmd[@]}" "$@" >"$tmp" 2>&1\n    rc=$?\n    if [[ "$rc" -eq 0 ]] && grep -q \'^wine-\' "$tmp"; then\n        sed -n \'/^wine-/p\' "$tmp"\n    else\n        cat "$tmp" >&2\n        [[ "$rc" -ne 0 ]] || rc=1\n    fi\n    exit "$rc"\nfi\n# No pipe between the emulator and application output.\nexec "${cmd[@]}" "$@"\n'
+WRAPPER_TEMPLATE = '#!/usr/bin/env bash\nset -uo pipefail\nRUNNER=@RUNNER_Q@\nBIN=@BIN_Q@\nROUTE=@ROUTE_Q@\nEMULATOR=@EMU_Q@\nPREFIX_ARCH=@ARCH_Q@\nPREFIX_DEFAULT=@PREFIX_Q@\nNAME="${0##*/}"\ncase "$NAME" in wine|wineserver) ;; *) exit 2;; esac\nunset WINE64 WINELOADER WINEDLLPATH LD_PRELOAD LD_LIBRARY_PATH\nunset WINE_DISABLE_FULLSCREEN_HACK STAGING_WRITECOPY\nexport WINE="$BIN/wine" WINESERVER="$BIN/wineserver"\nexport WINEPREFIX="${WINEPREFIX:-$PREFIX_DEFAULT}"\nexport WINEARCH="$PREFIX_ARCH"\nexport PATH="$BIN:$RUNNER/bin:$PATH"\nexport WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-winemenubuilder.exe=d}"\nif [[ "$ROUTE" == box64 ]]; then\n    export BOX64_PATH="$BIN:$RUNNER/bin"\n    export BOX64_NOBANNER=1\n    export BOX64_LD_LIBRARY_PATH=@X64LD_Q@\nfi\ncmd=("$RUNNER/bin/$NAME")\n[[ "$ROUTE" == native ]] || cmd=("$EMULATOR" "${cmd[@]}")\nif [[ "$NAME" == wine && "${1:-}" == --version ]]; then\n    tmp="$(mktemp)" || exit 1\n    trap \'rm -f -- "$tmp"\' EXIT\n    "${cmd[@]}" "$@" >"$tmp" 2>&1\n    rc=$?\n    if [[ "$rc" -eq 0 ]] && grep -q \'^wine-\' "$tmp"; then\n        sed -n \'/^wine-/p\' "$tmp"\n    else\n        cat "$tmp" >&2\n        [[ "$rc" -ne 0 ]] || rc=1\n    fi\n    exit "$rc"\nfi\n# No pipe between the emulator and application output.\nexec "${cmd[@]}" "$@"\n'
 
 
 def install_wrappers(runner, fex, prefix=None):
+    if ROUTE != 'native' and not fex:
+        raise RuntimeError(f'No {ROUTE} emulator configured for the wrappers.')
     bin_dir = DATA / 'bin'
     bin_dir.mkdir(parents=True, exist_ok=True)
     replacements = {
         '@RUNNER_Q@': shlex.quote(str(runner)), '@BIN_Q@': shlex.quote(str(bin_dir)),
         '@ROUTE_Q@': shlex.quote(ROUTE), '@EMU_Q@': shlex.quote(str(fex or '')),
         '@ARCH_Q@': shlex.quote(PREFIX_ARCH), '@PREFIX_Q@': shlex.quote(str(prefix or DATA / 'prefix')),
+        '@X64LD_Q@': shlex.quote(box64_ld_library_path()),
     }
     text = WRAPPER_TEMPLATE
     for key, value in replacements.items(): text = text.replace(key, value)
@@ -443,12 +752,36 @@ def install_wrappers(runner, fex, prefix=None):
     return bin_dir / 'wine', bin_dir / 'wineserver'
 
 
+def sha256_file(path):
+    h = hashlib.sha256()
+    with Path(path).open('rb') as f:
+        for block in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def cached_wine_archive():
+    """Reuse a previously downloaded, checksum-verified archive from any layout."""
+    for candidate in (CACHE / WINE_ARCHIVE, LEGACY_CACHE / 'wow64' / WINE_ARCHIVE,
+                      LEGACY_CACHE / 'box64-wow64' / WINE_ARCHIVE, LEGACY_CACHE / WINE_ARCHIVE):
+        if candidate.is_file() and sha256_file(candidate) == WINE_SHA256:
+            if candidate != CACHE / WINE_ARCHIVE:
+                CACHE.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(candidate, CACHE / WINE_ARCHIVE)
+                say(f'Reusing previously downloaded {WINE_ARCHIVE} from {candidate.parent}.', '32')
+            return CACHE / WINE_ARCHIVE
+    return None
+
+
+def runner_path():
+    return DATA / 'runners' / f'wine-{WINE_VERSION}-{WINE_FLAVOR}'
+
+
 def install_runner():
-    flavor = 'amd64-wow64' if ROUTE == 'box64' else 'x86'
-    runner = DATA / 'runners' / f'wine-{WINE_VERSION}-{flavor}'
+    runner = runner_path()
     wine = runner / 'bin/wine'
     if not (runner / '.complete').exists():
-        archive = download(WINE_URL, CACHE / WINE_ARCHIVE, WINE_SHA256)
+        archive = cached_wine_archive() or download(WINE_URL, CACHE / WINE_ARCHIVE, WINE_SHA256)
         runner.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=runner.parent) as t:
             tmp = Path(t)
@@ -458,7 +791,7 @@ def install_runner():
             if runner.exists(): raise RuntimeError(f'Incomplete runner exists: {runner}; inspect it first.')
             shutil.move(str(candidates[0].parent.parent), runner)
         atomic(runner / '.complete', json.dumps({'version': WINE_VERSION, 'sha256': WINE_SHA256}))
-    expected = 62 if ROUTE == 'box64' else 3
+    expected = 62 if WINE_FLAVOR == 'amd64-wow64' else 3
     for name in ('wine', 'wineserver'):
         target = runner / 'bin' / name
         if not target.is_file() or elf_machine(target.resolve()) != expected:
@@ -472,13 +805,22 @@ def check_wine_version(wine, prefix, fex):
     version = match.group(0).strip() if match else ''
     say(f'Wine: {version or "(no output)"} | route={ROUTE} | {wine}')
     if rc != 0 or not version:
+        detail = text
+        if ROUTE == 'box64':
+            _, logged = run([wine, '--version'], env=wine_env(prefix, {'BOX64_LOG': '1'}),
+                            timeout=120, check=False)
+            reasons = [ln for ln in logged.splitlines()
+                       if re.search(r'Error loading|Cannot dlopen|needed lib', ln)]
+            if reasons:
+                detail += '\nBox64 log:\n' + '\n'.join(dict.fromkeys(reasons))
         hints = {
             'fex': 'Verify configured FEX RootFS and that the selected FEX can execute x86 Linux binaries.',
-            'box64': 'Verify the native ARM64 Box64 package and its native library dependencies. '
-                     'Do not use the x86 Wine runner or reuse the FEX prefix.',
+            'box64': 'Verify the native ARM64 Box64 package. "Error loading needed lib X" means the emulated '
+                     'x86_64 library X is missing; the installer provisions libgcc_s automatically on the next '
+                     'run, or provision x86_64 libraries with box64-bundle-x86-libs.sh. Do not reuse the FEX prefix.',
             'native': 'Install your distro prebuilt 32-bit Linux runtime support (including graphics/audio).',
         }
-        raise RuntimeError(hints[ROUTE] + '\n' + text[-2500:])
+        raise RuntimeError(hints[ROUTE] + '\n' + detail[-2500:])
     if not re.match(r'^wine-10\.0(?:\s|$)', version):
         raise RuntimeError('Unexpected runner version: ' + version)
     return version
@@ -542,23 +884,37 @@ def choose_drive(prefix, source):
     raise RuntimeError('No free Wine drive letter available to expose the game directory.')
 
 
+def drive_visible(wine, prefix, drive):
+    """Ask Wine whether it lists a drive letter.
+
+    The check must stay quote-free: Wine's argv quoting and cmd.exe's quote
+    parsing disagree, so `if exist "path"` silently evaluates false.
+    """
+    rc, text = run([wine, 'cmd', '/d', '/c', f'if exist {drive}\\ echo AOE_DRIVE_OK'],
+                   env=wine_env(prefix), timeout=120, check=False)
+    return rc == 0 and 'AOE_DRIVE_OK' in text, text
+
+
 def map_drive(wine, prefix, source, aoc_rel):
     rel_win = str(aoc_rel).replace('/', '\\')
+    server = DATA / 'bin' / 'wineserver'
     try:
         letter = choose_drive(prefix, source)
         drive = letter.upper() + ':'
-        win_path = drive + '\\' + rel_win
-        rc, text = run([wine, 'cmd', '/d', '/c', f'if exist "{win_path}" echo AOE_DRIVE_OK'],
-                       env=wine_env(prefix), timeout=120, check=False)
-        if rc == 0 and 'AOE_DRIVE_OK' in text:
-            return drive, win_path
-        say('Drive mapping is on disk but not visible to the running Wine server. Using Z: for diagnostics.', '33')
+        for attempt in range(3):
+            visible, text = drive_visible(wine, prefix, drive)
+            if visible:
+                return drive, drive + '\\' + rel_win
+            # A running wineserver keeps the drive list it started with; restart it.
+            if attempt < 2 and server.is_file():
+                run([server, '-k'], env=wine_env(prefix), timeout=30, check=False)
+                run([server, '-w'], env=wine_env(prefix), timeout=45, check=False)
+        say(f'Drive {drive} exists on disk but Wine does not list it. Using Z: for diagnostics.', '33')
     except RuntimeError as exc:
         say(str(exc), '33')
     win_path = ('Z:' + str(Path(source).resolve())).replace('/', '\\') + '\\' + rel_win
-    rc, text = run([wine, 'cmd', '/d', '/c', f'if exist "{win_path}" echo AOE_DRIVE_OK'],
-                   env=wine_env(prefix), timeout=120, check=False)
-    if rc or 'AOE_DRIVE_OK' not in text:
+    visible, text = drive_visible(wine, prefix, 'Z:')
+    if not visible:
         raise RuntimeError('Game is not accessible through the selected Wine route.\n' + text[-1500:])
     return 'Z:', win_path
 
@@ -587,6 +943,12 @@ def install_winetricks():
     if wt.is_file():
         run(['bash', '-n', wt])
         return wt
+    legacy = LEGACY_DATA / 'tools' / 'winetricks'
+    if legacy.is_file():
+        atomic(wt, legacy.read_text(errors='replace'), 0o755)
+        run(['bash', '-n', wt])
+        say(f'Reusing winetricks already present at {legacy}.', '32')
+        return wt
     commit = api('https://api.github.com/repos/Winetricks/winetricks/commits/master')['sha']
     download(f'https://raw.githubusercontent.com/Winetricks/winetricks/{commit}/src/winetricks', wt)
     run(['bash', '-n', str(wt)])
@@ -596,16 +958,52 @@ def install_winetricks():
 
 
 def directplay_registered(wine, prefix):
-    rc, text = run([wine, 'reg', 'query', r'HKCU\Software\Wine\DllOverrides', '/v', 'dplayx'],
+    rc, text = run([wine, 'reg', 'query', r'HKCU\Software\Wine\DllOverrides'],
                    env=wine_env(prefix), check=False)
-    return rc == 0 and bool(re.search(r'REG_SZ\s+(?:native|n)(?:\s|,|$)', text, re.I))
+    # Winetricks stores native overrides under a wildcard value name, e.g. "*dplayx".
+    return rc == 0 and bool(re.search(r'"?\*?dplayx"?\s+REG_SZ\s+(?:native|n)\b', text, re.I))
+
+
+def winetricks_cache_dirs():
+    # Winetricks uses $WINETRICKS_CACHE when set, else $XDG_CACHE_HOME/winetricks.
+    return (CACHE / 'xdg' / 'winetricks', CACHE / 'winetricks')
+
+
+def seed_directplay_redist():
+    """Pre-seed winetricks' DirectX cache.
+
+    The directplay verb downloads directx_feb2010_redist.exe from a single
+    web.archive.org snapshot that regularly returns 503/404. Winetricks accepts
+    a cached file when its SHA256 matches, so fetch it from mirrors first.
+    """
+    targets = [d / 'directx9' / DIRECTX_REDIST_NAME for d in winetricks_cache_dirs()]
+    if any(t.is_file() and sha256_file(t) == DIRECTX_REDIST_SHA256 for t in targets):
+        return True
+    for url in DIRECTX_REDIST_MIRRORS:
+        try:
+            download(url, targets[0], DIRECTX_REDIST_SHA256)
+        except Exception as exc:
+            logging.warning('DirectX redist mirror failed: %s (%s)', url, exc)
+            say(f'  mirror unavailable ({url.split("/")[2]}); trying next', '33')
+            continue
+        for extra in targets[1:]:
+            extra.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(targets[0], extra)
+        return True
+    return False
 
 
 def install_components(wine, prefix, state, save):
     directory = windows32_dir(prefix)
     wt = install_winetricks()
+    # Winetricks inspects $WINE/$WINESERVER to detect arch and the WoW64 type.
+    # Our wrappers are shell scripts, which it cannot read; without the real
+    # binaries it assumes a nonexistent "wine64", and its %AppData% probe fails.
+    runner = runner_path()
     env = wine_env(prefix, {'WINETRICKS_CACHE': str(CACHE / 'winetricks'),
-                            'XDG_CACHE_HOME': str(CACHE / 'xdg')})
+                            'XDG_CACHE_HOME': str(CACHE / 'xdg'),
+                            'WINE_BIN': str(runner / 'bin' / 'wine'),
+                            'WINESERVER_BIN': str(runner / 'bin' / 'wineserver')})
     rc, installed = run([wt, 'list-installed'], env=env, check=False)
     have = all((directory / n).is_file() and pe_machine(directory / n) == 0x14c for n in DIRECTPLAY_FILES)
     ready = have and rc == 0 and 'directplay' in installed.splitlines() and directplay_registered(wine, prefix)
@@ -615,9 +1013,30 @@ def install_components(wine, prefix, state, save):
         server = DATA / 'bin/wineserver'
         run([server, '-k'], env=env, timeout=30, check=False)
         run([server, '-w'], env=env, timeout=45)
-        backup = backup_prefix(prefix, 'before-directplay')
-        say(f'Prefix backup: {backup}')
-        run([wt, '-q', 'directplay'], env=env, timeout=1200)
+        if yes('Back up the prefix before installing DirectPlay? (optional)', False):
+            backup = backup_prefix(prefix, 'before-directplay')
+            say(f'Prefix backup: {backup}', '33')
+        if not seed_directplay_redist():
+            say('  DirectX redist could not be pre-fetched; winetricks will try '
+                'archive.org itself (this often 503s).', '33')
+        last = ''
+        for attempt in range(1, 4):
+            rc, text = run([wt, '-q', 'directplay'], env=env, timeout=1800, check=False)
+            if rc == 0:
+                break
+            last = text[-1500:]
+            if attempt < 3:
+                say(f'  winetricks attempt {attempt}/3 failed; retrying in {5 * attempt}s', '33')
+                time.sleep(5 * attempt)
+        else:
+            cache = winetricks_cache_dirs()[0] / 'directx9'
+            raise RuntimeError(
+                'winetricks directplay failed after 3 attempts. Download\n'
+                f'  {DIRECTX_REDIST_NAME}\n'
+                f'(SHA256 {DIRECTX_REDIST_SHA256}) into\n'
+                f'  {cache}\n'
+                'and rerun, or retry later when archive.org is reachable.\n'
+                + last)
     missing = [n for n in DIRECTPLAY_FILES if not (directory / n).is_file()
                or pe_machine(directory / n) != 0x14c]
     if missing or not directplay_registered(wine, prefix):
@@ -663,7 +1082,7 @@ def make_icon(exe, ident, title):
     return svg
 
 
-LAUNCHER_TEMPLATE = '#!/usr/bin/env bash\nset -uo pipefail\numask 077\nBASE=@BASE_Q@\nRUNNER=@RUNNER_Q@\nPREFIX=@PREFIX_Q@\nGAME=@GAME_Q@\nDRIVE_PREF=@DRIVE_Q@\nGAME_REL=@REL_Q@\nMARKER=@MARKER_Q@\nFIXED_TARGET=@TARGET_Q@\nPREFIX_ARCH=@ARCH_Q@\nROUTE=@ROUTE_Q@\nTITLE=@TITLE_Q@\nBIN="$BASE/bin"\nLOG="$BASE/logs/@SLUG@-$(date +%Y%m%d-%H%M%S)-$$.log"\n[[ -x "$BIN/wine" && -x "$RUNNER/bin/wine" ]] || { echo \'Wine runner/wrapper missing.\' >&2; exit 1; }\n[[ -f "$PREFIX/system.reg" ]] || { echo \'Prefix missing.\' >&2; exit 1; }\ngrep -q "^#arch=$PREFIX_ARCH\\$" "$PREFIX/system.reg" || { echo \'Wrong prefix architecture.\' >&2; exit 1; }\nfor var in ${!WINE@} ${!BOX64_@} ${!BOX86_@} ${!FEX_@}; do\n    unset "$var"\ndone\nunset LD_PRELOAD LD_LIBRARY_PATH STAGING_WRITECOPY VOOBLY_DLLOVERRIDES\nexport WINE="$BIN/wine" WINESERVER="$BIN/wineserver"\nexport WINEPREFIX="$PREFIX" WINEARCH="$PREFIX_ARCH"\nexport PATH="$BIN:$RUNNER/bin:$PATH"\nexport WINEDLLOVERRIDES=\'winemenubuilder.exe=d\'\nexport WINEDEBUG=\'-all,err+all\'\nmkdir -p "$BASE/logs"\n# Locks are per shared game directory, not per emulator/prefix.\nLOCKFILE=@LOCK_Q@\nmkdir -p "$(dirname "$LOCKFILE")"\nexec 9>"$LOCKFILE"\nflock -n 9 || { echo \'Another managed game/Voobly launcher is using this game directory.\' >&2; exit 1; }\nHELPER="$BASE/tools/clear-directplay-conflict.sh"\nif [[ -x "$HELPER" ]]; then\n    "$HELPER" --check || {\n        echo "Inspect/close existing games first. For confirmed stale helpers run: $HELPER" >&2\n        exit 1\n    }\nfi\nensure_drive() {\n    local letter link\n    for letter in "$DRIVE_PREF" y x w v u t s r q p o n m l k j i h g f e d; do\n        link="$PREFIX/dosdevices/$letter:"\n        if [[ "$(readlink -f "$link" 2>/dev/null)" == "$(readlink -f "$GAME")" ]]; then\n            printf \'%s:\' "${letter^^}"; return\n        fi\n    done\n    for letter in "$DRIVE_PREF" y x w v u t s r q p o n m l k j i h g f e d; do\n        link="$PREFIX/dosdevices/$letter:"\n        if [[ ! -e "$link" && ! -L "$link" ]]; then\n            ln -s -- "$GAME" "$link" || return 1\n            printf \'%s:\' "${letter^^}"; return\n        fi\n    done\n    return 1\n}\nif [[ -n "$GAME_REL" ]]; then\n    TARGET="$GAME/$GAME_REL"\nelse\n    TARGET="$FIXED_TARGET"\n    DRIVE="$(ensure_drive || true)"\n    if [[ -n "$DRIVE" ]]; then\n        printf \'Game mapping: %s -> %s\\n\' "$DRIVE" "$GAME"\n    else\n        echo \'No spare drive letter; select the game through Z: in Voobly.\' >&2\n    fi\nfi\n[[ -f "$TARGET" ]] || { echo "Missing executable: $TARGET" >&2; exit 1; }\ncd "$GAME" || exit 1\nprintf \'Starting %s via %s without a time limit.\\nLog: %s\\n\' "$TITLE" "$ROUTE" "$LOG"\n"$WINE" "$TARGET" @ARGS@ "$@" 9>&- >"$LOG" 2>&1 &\nchild=$!\n# Sample process mappings to flag accidental fallback to the other emulator.\nsleep 1\nif ! python3 "$BASE/tools/audit-route.py" "$PREFIX" "$ROUTE" >>"$LOG" 2>&1; then\n    echo "Wrong emulator detected. Close the application; inspect $LOG" >&2\nfi\nwait "$child"\nrc=$?\nprintf \'@SLUG@_EXIT=%s\\nLog: %s\\n\' "$rc" "$LOG"\n[[ "$rc" -eq 0 ]] || tail -n 80 "$LOG"\nexit "$rc"\n'
+LAUNCHER_TEMPLATE = '#!/usr/bin/env bash\nset -uo pipefail\numask 077\nBASE=@BASE_Q@\nRUNNER=@RUNNER_Q@\nPREFIX=@PREFIX_Q@\nGAME=@GAME_Q@\nDRIVE_PREF=@DRIVE_Q@\nGAME_REL=@REL_Q@\nMARKER=@MARKER_Q@\nFIXED_TARGET=@TARGET_Q@\nPREFIX_ARCH=@ARCH_Q@\nROUTE=@ROUTE_Q@\nTITLE=@TITLE_Q@\nBIN="$BASE/bin"\nLOG="$BASE/logs/@SLUG@-$(date +%Y%m%d-%H%M%S)-$$.log"\n[[ -x "$BIN/wine" && -x "$RUNNER/bin/wine" ]] || { echo \'Wine runner/wrapper missing.\' >&2; exit 1; }\n[[ -f "$PREFIX/system.reg" ]] || { echo \'Prefix missing.\' >&2; exit 1; }\ngrep -q "^#arch=$PREFIX_ARCH\\$" "$PREFIX/system.reg" || { echo \'Wrong prefix architecture.\' >&2; exit 1; }\nfor var in ${!WINE@} ${!BOX64_@} ${!BOX86_@} ${!FEX_@}; do\n    unset "$var"\ndone\nunset LD_PRELOAD LD_LIBRARY_PATH STAGING_WRITECOPY VOOBLY_DLLOVERRIDES\nexport WINE="$BIN/wine" WINESERVER="$BIN/wineserver"\nexport WINEPREFIX="$PREFIX" WINEARCH="$PREFIX_ARCH"\nexport PATH="$BIN:$RUNNER/bin:$PATH"\nexport WINEDLLOVERRIDES=\'winemenubuilder.exe=d\'\nexport WINEDEBUG=\'-all,err+all\'\nif [[ "$ROUTE" == box64 ]]; then\n    export BOX64_NOBANNER=1 BOX64_LD_LIBRARY_PATH=@X64LD_Q@\nfi\nmkdir -p "$BASE/logs"\n# Locks are per shared game directory, not per emulator/prefix.\nLOCKFILE=@LOCK_Q@\nmkdir -p "$(dirname "$LOCKFILE")"\nexec 9>"$LOCKFILE"\nflock -n 9 || { echo \'Another managed game/Voobly launcher is using this game directory.\' >&2; exit 1; }\nHELPER="$BASE/tools/clear-directplay-conflict.sh"\nif [[ -x "$HELPER" ]]; then\n    "$HELPER" --check || {\n        echo "Inspect/close existing games first. For confirmed stale helpers run: $HELPER" >&2\n        exit 1\n    }\nfi\nensure_drive() {\n    local letter link\n    for letter in "$DRIVE_PREF" y x w v u t s r q p o n m l k j i h g f e d; do\n        link="$PREFIX/dosdevices/$letter:"\n        if [[ "$(readlink -f "$link" 2>/dev/null)" == "$(readlink -f "$GAME")" ]]; then\n            printf \'%s:\' "${letter^^}"; return\n        fi\n    done\n    for letter in "$DRIVE_PREF" y x w v u t s r q p o n m l k j i h g f e d; do\n        link="$PREFIX/dosdevices/$letter:"\n        if [[ ! -e "$link" && ! -L "$link" ]]; then\n            ln -s -- "$GAME" "$link" || return 1\n            printf \'%s:\' "${letter^^}"; return\n        fi\n    done\n    return 1\n}\nif [[ -n "$GAME_REL" ]]; then\n    TARGET="$GAME/$GAME_REL"\nelse\n    TARGET="$FIXED_TARGET"\n    DRIVE="$(ensure_drive || true)"\n    if [[ -n "$DRIVE" ]]; then\n        printf \'Game mapping: %s -> %s\\n\' "$DRIVE" "$GAME"\n    else\n        echo \'No spare drive letter; select the game through Z: in Voobly.\' >&2\n    fi\nfi\n[[ -f "$TARGET" ]] || { echo "Missing executable: $TARGET" >&2; exit 1; }\ncd "$GAME" || exit 1\nprintf \'Starting %s via %s without a time limit.\\nLog: %s\\n\' "$TITLE" "$ROUTE" "$LOG"\n"$WINE" "$TARGET" @ARGS@ "$@" 9>&- >"$LOG" 2>&1 &\nchild=$!\n# Sample process mappings to flag accidental fallback to the other emulator.\nsleep 1\nif ! python3 "$BASE/tools/audit-route.py" "$PREFIX" "$ROUTE" >>"$LOG" 2>&1; then\n    echo "Wrong emulator detected. Close the application; inspect $LOG" >&2\nfi\nwait "$child"\nrc=$?\nprintf \'@SLUG@_EXIT=%s\\nLog: %s\\n\' "$rc" "$LOG"\n[[ "$rc" -eq 0 ]] || tail -n 80 "$LOG"\nexit "$rc"\n'
 
 
 def make_launcher(slug, title, target, args, runner, prefix, source, drive, fex, rel='', marker=''):
@@ -674,6 +1093,7 @@ def make_launcher(slug, title, target, args, runner, prefix, source, drive, fex,
         '@REL_Q@': rel, '@MARKER_Q@': marker, '@TARGET_Q@': target,
         '@ARCH_Q@': PREFIX_ARCH, '@ROUTE_Q@': ROUTE, '@TITLE_Q@': title,
         '@LOCK_Q@': BASE_DATA / 'locks' / (gameid + '.lock'),
+        '@X64LD_Q@': shlex.quote(box64_ld_library_path()),
     }
     text = LAUNCHER_TEMPLATE
     for key, value in values.items(): text = text.replace(key, shlex.quote(str(value)))
@@ -702,9 +1122,23 @@ def menu_entry(slug, title, launcher, icon, ident, source):
 PORT_HELPER = '#!/usr/bin/env bash\nset -euo pipefail\nMODE="${1:-interactive}"\ncase "$MODE" in --check|--auto|interactive) ;; *) echo \'Usage: helper [--check]\' >&2; exit 2;; esac\nDEFAULT_PREFIX=@PREFIX_Q@\nPREFIX="${WINEPREFIX:-$DEFAULT_PREFIX}"\ncommand -v ss >/dev/null || { echo \'ss is required (iproute2/iproute).\' >&2; exit 1; }\nsockets() { ss -H -lntup \'sport = :47624\'; }\ncurrent="$(sockets)"\n[[ -n "$current" ]] || exit 0\nprintf \'Port 47624 is occupied; an owner is not automatically stale:\\n%s\\n\' "$current"\nif [[ "$MODE" != interactive ]]; then\n    echo \'No process was stopped. Close active applications and inspect the helper manually.\' >&2\n    exit 1\nfi\nprefix_of() { tr \'\\0\' \'\\n\' <"/proc/$1/environ" 2>/dev/null | sed -n \'s/^WINEPREFIX=//p\'; }\nstart_of() { sed \'s/^.*) //\' "/proc/$1/stat" | awk \'{print $20}\'; }\nvalid() {\n    local pid="$1"\n    [[ -O "/proc/$pid" && -r "/proc/$pid/comm" ]] || return 1\n    [[ "$(tr \'[:upper:]\' \'[:lower:]\' <"/proc/$pid/comm")" == dplaysvr.exe ]] || return 1\n    [[ "$(prefix_of "$pid")" == "$PREFIX" ]] || return 1\n}\n# Never terminate a helper while a recognized live game or Voobly client exists, in any prefix.\nfor p in /proc/[0-9]*; do\n    [[ -O "$p" && -r "$p/comm" ]] || continue\n    name="$(tr \'[:upper:]\' \'[:lower:]\' <"$p/comm" 2>/dev/null || true)"\n    case "$name" in\n        empires2.exe|age2_x1.exe|age2.exe|age2x1.exe|voobly.exe)\n            state="$(awk \'{print $3}\' "$p/stat" 2>/dev/null || true)"\n            if [[ "$state" != Z ]]; then\n                echo \'Close all games and Voobly clients before terminating helpers.\' >&2; exit 1\n            fi;;\n    esac\ndone\nfor pid in $(printf \'%s\\n\' "$current" | grep -o \'pid=[0-9]*\' | cut -d= -f2 | sort -u); do\n    valid "$pid" || continue\n    start="$(start_of "$pid")"\n    ps -p "$pid" -o pid,ppid,user,stat,etime,args\n    read -r -p "Stop this confirmed leftover helper in $PREFIX? [y/N] " answer </dev/tty\n    case "$answer" in y|Y|yes|YES) ;; *) continue;; esac\n    valid "$pid" && [[ "$(start_of "$pid")" == "$start" ]] || continue\n    kill -TERM "$pid" 2>/dev/null || true\n    for _ in {1..10}; do\n        [[ -d "/proc/$pid" ]] || break\n        sleep 1\n    done\n    if valid "$pid" && [[ "$(start_of "$pid")" == "$start" ]]; then\n        state="$(awk \'{print $3}\' "/proc/$pid/stat" 2>/dev/null || true)"\n        if [[ "$state" != Z ]]; then\n            read -r -p "Same helper remains. Force-stop PID $pid? [y/N] " answer </dev/tty\n            case "$answer" in\n                y|Y|yes|YES)\n                    valid "$pid" && [[ "$(start_of "$pid")" == "$start" ]] && kill -KILL "$pid" || true;;\n            esac\n        fi\n    fi\ndone\nsleep 1\nleft="$(sockets)"\n[[ -z "$left" ]] || { printf \'Port remains occupied:\\n%s\\n\' "$left"; exit 1; }\necho \'Port 47624 is free. No game files or network configuration were changed.\'\n'
 
 
+def attach_terminal():
+    """Interactive prompts must not read the piped script source.
+
+    With `curl ... | python3` stdin is the script itself; reopen the controlling
+    terminal so ask()/yes() keep working.
+    """
+    try:
+        if sys.stdin is None or not sys.stdin.isatty():
+            sys.stdin = open('/dev/tty', 'r', encoding='utf-8', errors='replace')
+    except OSError:
+        pass
+
+
 def main():
     if sys.version_info < (3, 9): raise RuntimeError('Python 3.9 or newer is required; install a prebuilt distro Python.')
     if sys.platform != 'linux': raise RuntimeError('This utility supports Linux only.')
+    attach_terminal()
     configure_route()
     if os.geteuid() == 0: raise RuntimeError('Run as your desktop user, not root or sudo.')
     LOG.parent.mkdir(parents=True, exist_ok=True); CACHE.mkdir(parents=True, exist_ok=True)
@@ -716,6 +1150,8 @@ def main():
         '║           AGE OF EMPIRES II  ×  VOOBLY                       ║\n'
         '║           Classic games. A dedicated Linux home.             ║\n'
         '╚══════════════════════════════════════════════════════════════╝', '1;33')
+    if VERBOSE:
+        say('Verbose mode: every command and its output is printed as it runs.', '2')
 
     stage(1, 'Choose your installation paths')
     source = path_input('Original AoE II game directory', HOME / 'Games/Age of Empires II', 'dir')
@@ -746,23 +1182,34 @@ def main():
     if not os.environ.get('DISPLAY'):
         say('Wayland-only session: Wine may require working XWayland unless its Wayland driver is configured.', '33')
 
-    ident = ROUTE + '-' + hashlib.sha256(str(prefix).encode()).hexdigest()[:12]
+    ident = hashlib.sha256(str(prefix).encode()).hexdigest()[:12]
     statefile = DATA / 'installs' / (ident + '.json')
     state = json.loads(statefile.read_text()) if statefile.exists() else {'id': ident, 'source': str(source)}
     if state['source'] != str(source): raise RuntimeError('This prefix is registered to a different source; select a new prefix.')
-    if prefix.exists() and any(prefix.iterdir()) and not statefile.exists():
+    if (prefix.exists() and any(prefix.iterdir()) and not statefile.exists()
+            and not str(prefix).startswith(str(DATA) + os.sep)):
         raise RuntimeError('Nonempty unmanaged prefix: refusing to mutate it. Choose a new empty prefix.')
 
-    if state.get('route', ROUTE) != ROUTE:
-        raise RuntimeError('Prefix belongs to another execution route.')
-    if prefix_arch(prefix) not in (None, PREFIX_ARCH):
-        raise RuntimeError('Prefix architecture does not match this route; select a new prefix.')
     state.update(route=ROUTE, prefix_architecture=PREFIX_ARCH)
     say(f'\nHost: {machine}\nOriginal: {source}\nConquerors: {aoc_rel}\nSetup: {setup}\nPrefix: {prefix}')
     say(f'Route: {ROUTE} | Wine archive: {WINE_ARCHIVE} | prefix: {PREFIX_ARCH}\n'
-        f'Workspace: {DATA}\nExisting game is shared read-write; other routes are not modified.')
+        f'Workspace: {DATA}\nExisting game is shared read-write; nothing outside this workspace is modified.')
     if not yes('Proceed with this configuration?', True): return
     def save(): atomic(statefile, json.dumps(state, indent=2))
+
+    previous = state.get('route')
+    if previous and previous != ROUTE:
+        say(f'Switching the emulator for this prefix: {previous} -> {ROUTE}; '
+            f'stopping {previous} processes on it first.', '33')
+        stop_route_processes(prefix)
+
+    # Already present for this prefix is reused by default; replacing is explicit.
+    fresh = reuse_or_replace(prefix, statefile, ident, source)
+    if fresh is not None:
+        state = fresh
+
+    if prefix_arch(prefix) not in (None, PREFIX_ARCH):
+        raise RuntimeError('Prefix architecture does not match this route; select a new prefix.')
 
     stage(2, 'Distribution, prebuilt emulator and helper preflight')
     fex = None
@@ -773,9 +1220,11 @@ def main():
         say('Native x86 CPU: no emulator is used.', '32')
     tools()
 
-    stage(3, 'Install and verify the route-specific prebuilt Wine runner')
+    stage(3, 'Install and verify the prebuilt Wine runner')
     say(f'Runner: Kron4ek {WINE_ARCHIVE} (pinned SHA256)')
     runner = install_runner()
+    if ROUTE == 'box64':
+        ensure_box64_x64libs(runner)
     wine, _ = install_wrappers(runner, fex, prefix)
     version = check_wine_version(wine, prefix, fex)
     state.update(wine=str(wine), runner=str(runner), route=ROUTE, emulator=str(fex or ''), arch=arch, version=version); save()
@@ -791,7 +1240,7 @@ def main():
     state['game_drive'] = drive; save()
     # Voobly's Game Diagnostics may patch this shared directory; keep a backup first.
     have_backup = bool(state.get('game_backup')) and Path(state['game_backup']).is_dir()
-    if not have_backup and yes('Back up the original game directory before Voobly can patch it?', True):
+    if not have_backup and yes('Back up the original game directory before Voobly can patch it? (optional)', False):
         backup = backup_game(source)
         if backup:
             state['game_backup'] = str(backup)
@@ -859,13 +1308,39 @@ def main():
     created['voobly'] = make_launcher('play-voobly', 'Voobly', str(voobly), '', runner, prefix, source, drive, fex,
                                       marker=str(aoc_rel).replace(os.sep, '\\'))
 
-    entries = []
+    entries, icons_used = [], []
     for slug, (script, title, target, args) in launchers.items():
         exe = aok[0] if slug == 'aok' else aoc[0]
         icon = make_icon(exe, f'aoe2-voobly-{ident}-{slug}', title)
+        icons_used.append(str(icon))
         entries.append(str(menu_entry(slug, title, created[slug], icon, ident, source)))
     icon = make_icon(voobly, f'aoe2-voobly-{ident}-voobly', 'Voobly')
+    icons_used.append(str(icon))
     entries.append(str(menu_entry('voobly', 'Voobly', created['voobly'], icon, ident, source)))
+    # Drop menu entries/icons left behind by an earlier workspace or ident so
+    # switching never duplicates the menu. Entries of other layouts are kept.
+    owned = (str(DATA), str(LEGACY_DATA / 'routes' / 'wow64'),
+             str(LEGACY_DATA / 'routes' / 'box64-wow64'))
+    stale_icons = set()
+    for stale in sorted(APPS.glob('aoe2-voobly-*')):
+        if '.bak-' in stale.name or str(stale) in entries:
+            continue
+        stale_text = stale.read_text(errors='replace')
+        if any(path in stale_text for path in owned):
+            stale.unlink()
+            for line in stale_text.splitlines():
+                if line.startswith('Icon='):
+                    stale_icons.add(line[5:])
+            say(f'Removed stale desktop entry: {stale.name}', '33')
+    for icon_path in sorted(stale_icons):
+        target_icon = Path(icon_path)
+        if target_icon.is_file() and str(target_icon) not in icons_used:
+            target_icon.unlink()
+    for icon_dir in (ICONS, ICONS.parent.parent / 'scalable/apps'):
+        if icon_dir.is_dir():
+            for stale in sorted(icon_dir.glob('aoe2-voobly-*')):
+                if str(stale) not in icons_used:
+                    stale.unlink()
     if shutil.which('update-desktop-database'):
         run(['update-desktop-database', APPS], check=False)
 
@@ -923,8 +1398,16 @@ def main():
     report = DATA / 'logs' / (STAMP + '-summary.json'); atomic(report, json.dumps(summary, indent=2))
 
     complete = bool(checks) and all(v == 'USER CONFIRMED' for v in checks.values())
-    say('\n' + ('INSTALLATION COMPLETE — application screens confirmed' if complete
-                else 'INSTALLATION PREPARED — visual checks incomplete'), '1;32' if complete else '1;33')
+    title = ('INSTALLATION COMPLETE — application screens confirmed' if complete
+             else 'INSTALLATION PREPARED — visual checks incomplete')
+    colour = '1;32' if complete else '1;33'
+    if COLOR:
+        say('', colour)
+        say('  ╔' + '═' * 70 + '╗', colour)
+        say('  ║  ' + ('✔ ' if complete else '▶ ') + title.ljust(67) + '║', colour)
+        say('  ╚' + '═' * 70 + '╝', colour)
+    else:
+        say('\n' + title)
     for k, v in summary.items():
         say(f'{k}: {json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v}')
     say('\nRemaining manual steps:\n'
