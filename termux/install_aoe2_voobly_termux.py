@@ -899,7 +899,7 @@ unset WINE_DISABLE_FULLSCREEN_HACK STAGING_WRITECOPY
 export WINE="$BIN/wine" WINESERVER="$BIN/wineserver"
 export WINEPREFIX="${WINEPREFIX:-$PREFIX_DEFAULT}"
 export WINEARCH="$PREFIX_ARCH"
-export PATH="$BASE/tools/native-bin:$BIN:$RUNNER/bin:$PATH"
+export PATH="$BIN:$RUNNER/bin:$PATH"
 export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-winemenubuilder.exe=d}"
 export DISPLAY="${DISPLAY:-:0}"
 export PULSE_SERVER="${PULSE_SERVER:-tcp:127.0.0.1}"
@@ -913,7 +913,7 @@ if [[ "$ROUTE" == box64 ]]; then
 fi
 cmd=("${EMU[@]}" "$RUNNER/bin/$NAME")
 # glibc processes must not inherit Termux's bionic LD_PRELOAD (libtermux-exec).
-launch() { env -u LD_PRELOAD "${EMU_ENV[@]}" "${cmd[@]}" "$@"; }
+launch() { env -u LD_PRELOAD -u LD_LIBRARY_PATH "${EMU_ENV[@]}" "${cmd[@]}" "$@"; }
 if [[ "$NAME" == wine && "${1:-}" == --version ]]; then
     tmp="$(mktemp)" || exit 1
     trap 'rm -f -- "$tmp"' EXIT
@@ -928,7 +928,7 @@ if [[ "$NAME" == wine && "${1:-}" == --version ]]; then
     exit "$rc"
 fi
 # No pipe between the emulator and application output.
-exec env -u LD_PRELOAD "${EMU_ENV[@]}" "${cmd[@]}" "$@"
+exec env -u LD_PRELOAD -u LD_LIBRARY_PATH "${EMU_ENV[@]}" "${cmd[@]}" "$@"
 '''
 
 BOX64_ENV_TEMPLATE = '''# Optional Box64 tuning, sourced by the wine wrappers. Examples (uncomment to try):
@@ -943,21 +943,27 @@ def install_wrappers(runner, prefix=None):
     if not EMU_CMD: raise RuntimeError('No emulator configured for the wrappers.')
     bin_dir = DATA / 'bin'
     bin_dir.mkdir(parents=True, exist_ok=True)
-    # Box64 needs the native AArch64 glibc libraries for its dlopen wrappers.
-    # Keep these separate from the guest x86_64 BOX64_LD_LIBRARY_PATH.
     host_env = dict(EMU_ENV)
+    host_env.pop('LD_LIBRARY_PATH', None)
+    emu_cmd = list(EMU_CMD)
     if ROUTE == 'box64':
-        host_env.setdefault('LD_LIBRARY_PATH', str(GLIBC_LIB))
+        # Scope native library lookup to the loader, not the environment
+        # inherited by Bionic subprocesses (lscpu, env, shell, ...).
+        if len(emu_cmd) == 1:
+            emulator = Path(emu_cmd[0])
+            loader = Path(elf_interp(emulator))
+            if not loader.is_file():
+                raise RuntimeError(f'Box64 glibc interpreter not found: {loader}')
+            emu_cmd = [str(loader), '--library-path', str(GLIBC_LIB), str(emulator)]
+        else:
+            raise RuntimeError('Box64 requires a direct ELF emulator for isolated glibc startup; '
+                               'pass --emulator pointing to the box64-glibc ELF, not a launcher.')
     env_items = [f'{k}={v}' for k, v in host_env.items()]
-    # Strip glibc variables before the bionic lscpu is loaded.
-    bridge = ('#!' + str(TERMUX / 'bin/env') + ' -S -u LD_LIBRARY_PATH -u LD_PRELOAD '
-              + str(BASH) + '\nexec ' + shlex.quote(str(TERMUX / 'bin/lscpu')) + ' "$@"\n')
-    atomic(DATA / 'tools/native-bin/lscpu', bridge, 0o755)
     replacements = {
         '@BASH@': str(BASH), '@RUNNER_Q@': shlex.quote(str(runner)), '@BIN_Q@': shlex.quote(str(bin_dir)),
         '@ROUTE_Q@': shlex.quote(ROUTE), '@ARCH_Q@': shlex.quote(PREFIX_ARCH),
         '@PREFIX_Q@': shlex.quote(str(prefix or DATA / 'prefix')),
-        '@EMU@': shlex.join(EMU_CMD), '@EMU_ENV@': shlex.join(env_items),
+        '@EMU@': shlex.join(emu_cmd), '@EMU_ENV@': shlex.join(env_items),
         '@TMPDIR_Q@': shlex.quote(str(TERMUX / 'tmp')),
         '@X64LD_Q@': shlex.quote(box64_ld_library_path(runner)),
         '@BOX64_PRESET_Q@': shlex.quote(OPTIONS.box64_preset),
@@ -1297,7 +1303,8 @@ def register_directplay(wine, prefix):
         dll = windows32_dir(prefix) / name
         if pe_machine(dll) != 0x14c:
             raise RuntimeError(f'Missing or non-i386 DirectPlay DLL: {dll}')
-        command = [wine, str(windows32_dir(prefix) / 'regsvr32.exe'), '/s', str(dll)]
+        command = [wine, r'C:\windows\syswow64\regsvr32.exe', '/s',
+                   'C:\\windows\\syswow64\\' + name]
         rc, output = run(command, env=env, timeout=180, check=False)
         if rc:
             raise RuntimeError(f'DirectPlay registration failed for {name} (exit {rc}). '
