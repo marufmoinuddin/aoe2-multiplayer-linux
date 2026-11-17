@@ -458,7 +458,7 @@ def on_shared_storage(path):
 
 
 # ------------------------------------------------------------ Termux pkgs ---
-BASE_PACKAGES = ['termux-x11-nightly', 'pulseaudio', 'curl', 'tar', 'xz-utils', 'zstd', 'coreutils',
+BASE_PACKAGES = ['termux-x11-nightly', 'xorg-xdpyinfo', 'pulseaudio', 'curl', 'tar', 'xz-utils', 'zstd', 'coreutils',
                  'cabextract', 'unzip', 'file', 'gawk', 'grep', 'sed', 'util-linux', 'procps',
                  'libarchive', 'findutils']
 
@@ -535,9 +535,12 @@ aoe2_session_start() {
         nohup termux-x11 :0 -ac >"${BASH_SOURCE[0]%/*}/termux-x11.log" 2>&1 &
     fi
     am start --user 0 -n com.termux.x11/com.termux.x11.MainActivity >/dev/null 2>&1 || true
-    for ((i=0; i<40; i++)); do [[ -S "$X_SOCKET" ]] && break; sleep 0.5; done
-    if [[ ! -S "$X_SOCKET" ]]; then
-        echo "Termux:X11 did not create $X_SOCKET. Install the companion APK matching termux-x11-nightly, open it, and retry. Server log: ${BASH_SOURCE[0]%/*}/termux-x11.log" >&2
+    for ((i=0; i<20; i++)); do
+        if [[ -S "$X_SOCKET" ]] && timeout 2 xdpyinfo -display :0 >/dev/null 2>&1; then break; fi
+        sleep 0.5
+    done
+    if (( i == 20 )); then
+        echo "Termux:X11 did not accept an X11 client on :0 ($X_SOCKET). Install the companion APK matching termux-x11-nightly, open it, and retry. Server log: ${BASH_SOURCE[0]%/*}/termux-x11.log" >&2
         return 1
     fi
     export DISPLAY=:0 PULSE_SERVER=tcp:127.0.0.1
@@ -904,6 +907,7 @@ export TMPDIR="${TMPDIR:-@TMPDIR_Q@}"
 if [[ "$ROUTE" == box64 ]]; then
     export BOX64_PATH="$BIN:$RUNNER/bin"
     export BOX64_NOBANNER=1
+    if [[ @BOX64_PRESET_Q@ == compatibility ]]; then export BOX64_DYNAREC=0; fi
     export BOX64_LD_LIBRARY_PATH=@X64LD_Q@
     if [[ -r "$BASE/box64.env" ]]; then set -a; . "$BASE/box64.env"; set +a; fi
 fi
@@ -952,6 +956,7 @@ def install_wrappers(runner, prefix=None):
         '@EMU@': shlex.join(EMU_CMD), '@EMU_ENV@': shlex.join(env_items),
         '@TMPDIR_Q@': shlex.quote(str(TERMUX / 'tmp')),
         '@X64LD_Q@': shlex.quote(box64_ld_library_path(runner)),
+        '@BOX64_PRESET_Q@': shlex.quote(OPTIONS.box64_preset),
     }
     text = WRAPPER_TEMPLATE
     for key, value in replacements.items(): text = text.replace(key, value)
@@ -1356,17 +1361,20 @@ mkdir -p "$BASE/logs"
 # shellcheck disable=SC1091
 . "$BASE/tools/session.sh"
 aoe2_session_start || exit 1
-# Locks are per shared game directory, not per prefix.
+# Separate game/lobby locks allow Voobly and AoE II to coexist.
 LOCKFILE=@LOCK_Q@
-mkdir -p "$(dirname "$LOCKFILE")"
-if command -v flock >/dev/null 2>&1; then
-    exec 9>"$LOCKFILE"
-    flock -n 9 || { echo 'Another managed game/Voobly launcher is using this game directory.' >&2; exit 1; }
-fi
-HELPER="$BASE/tools/clear-directplay-conflict.sh"
-if [[ -x "$HELPER" ]]; then
-    # Force-start: always free port 47624 before launching.
-    "$HELPER" --force || echo "warning: port 47624 is still in use; continuing anyway." >&2
+mkdir -p "$(dirname "$LOCKFILE")" || exit 1
+exec 9>"$LOCKFILE"
+flock -n 9 || { echo 'A launcher of this type is already running.' >&2; exit 1; }
+LOCKFILE_BASE=@LOCK_BASE_Q@
+exec 8>"$LOCKFILE_BASE.preflight.lock"
+flock -w 10 8 || { echo 'Another launch is preparing this game directory.' >&2; exit 1; }
+@PYTHON_Q@ "$BASE/tools/multiplayer-preflight.py" "$PREFIX" @SLUG@ @VOOBLY_PORT@ "$LOCKFILE_BASE" || exit 1
+# Check the prefix registry as well as the 32-bit DLLs before launching.
+if ! timeout 30 "$WINE" reg query 'HKCU\Software\Wine\DllOverrides' 8>&- 9>&- 2>/dev/null |
+    grep -Ei '(^|[[:space:]])\*?dplayx[[:space:]]+REG_SZ[[:space:]]+(native|n)([,[:space:]]|$)' >/dev/null; then
+    echo 'Native DirectPlay override missing or unreadable; rerun the installer to repair this prefix.' >&2
+    exit 1
 fi
 ensure_drive() {
     local letter link
@@ -1399,8 +1407,9 @@ fi
 [[ -f "$TARGET" ]] || { echo "Missing executable: $TARGET" >&2; exit 1; }
 cd "$GAME" || exit 1
 printf 'Starting %s via %s without a time limit.\nLog: %s\n' "$TITLE" "$ROUTE" "$LOG"
-"$WINE" "$TARGET" @ARGS@ "$@" 9>&- >"$LOG" 2>&1 &
+"$WINE" "$TARGET" @ARGS@ "$@" 8>&- 9>&- >"$LOG" 2>&1 &
 child=$!
+exec 8>&-
 wait "$child"
 rc=$?
 printf '@SLUG@_EXIT=%s\nLog: %s\n' "$rc" "$LOG"
@@ -1411,11 +1420,13 @@ exit "$rc"
 
 def make_launcher(slug, title, target, args, runner, prefix, source, drive, rel=''):
     gameid = hashlib.sha256(str(Path(source).resolve()).encode()).hexdigest()[:24]
+    lock_base = BASE_DATA / 'locks' / gameid
     values = {
+        '@LOCK_BASE_Q@': lock_base, '@PYTHON_Q@': sys.executable, '@VOOBLY_PORT@': OPTIONS.voobly_port,
         '@BASE_Q@': DATA, '@RUNNER_Q@': runner, '@PREFIX_Q@': prefix,
         '@GAME_Q@': source, '@DRIVE_Q@': 'y' if drive.upper().startswith('Z') else drive[0].lower(),
         '@REL_Q@': rel, '@TARGET_Q@': target, '@ARCH_Q@': PREFIX_ARCH, '@ROUTE_Q@': ROUTE,
-        '@TITLE_Q@': title, '@RENDERER_Q@': RENDERER, '@LOCK_Q@': BASE_DATA / 'locks' / (gameid + '.lock'),
+        '@TITLE_Q@': title, '@RENDERER_Q@': RENDERER, '@LOCK_Q@': str(lock_base) + ('.lobby.lock' if slug == 'play-voobly' else '.game.lock'),
     }
     text = LAUNCHER_TEMPLATE.replace('@BASH@', str(BASH))
     for key, value in values.items(): text = text.replace(key, shlex.quote(str(value)))
@@ -1455,68 +1466,93 @@ fi
 echo 'Stopped.'
 '''
 
-PORT_HELPER = r'''#!@BASH@
-# Free TCP/UDP 47624 before launching. Launchers call --force: terminate this
-# user's dplaysvr helpers (TERM then KILL) and restart the prefix's wineserver
-# if the socket survives. No prompts, no grace.
-set -uo pipefail
-MODE="${1:---force}"
-case "$MODE" in --check|--force|interactive) ;; *) echo 'Usage: helper [--check|--force|interactive]' >&2; exit 2;; esac
-DEFAULT_PREFIX=@PREFIX_Q@
-WINESERVER_BIN=@WINESERVER_Q@
-PREFIX="${WINEPREFIX:-$DEFAULT_PREFIX}"
-HEXPORT="$(printf '%04X' 47624)"
-# Android 10+ hides /proc/net from apps; when unreadable this reports "free".
-port_busy() {
-    awk -v p=":$HEXPORT" 'NR>1 && $4=="0A" && toupper($2) ~ (p "$") {f=1} END {exit !f}' \
-        /proc/net/tcp /proc/net/tcp6 2>/dev/null
-}
-prefix_of() { tr '\0' '\n' <"/proc/$1/environ" 2>/dev/null | sed -n 's/^WINEPREFIX=//p'; }
-comm_of() { tr '[:upper:]' '[:lower:]' <"/proc/$1/comm" 2>/dev/null; }
-helpers() {
-    local p pid
-    for p in /proc/[0-9]*; do
-        pid="${p#/proc/}"
-        [[ -O "$p" && -r "$p/comm" ]] || continue
-        [[ "$(comm_of "$pid")" == dplaysvr.exe ]] || continue
-        if [[ "$(prefix_of "$pid")" == "$PREFIX" ]]; then echo "$pid"; fi
-    done
-}
-stop_pid() {
-    local pid=$1 state
-    [[ -O "/proc/$pid" ]] || return 0
-    kill -TERM "$pid" 2>/dev/null || return 0
-    for _ in {1..20}; do [[ -d "/proc/$pid" ]] || return 0; sleep 0.25; done
-    state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || true)"
-    [[ "$state" == Z ]] || kill -KILL "$pid" 2>/dev/null || true
-}
-if [[ "$MODE" == --check ]]; then
-    port_busy && { echo 'Port 47624 is occupied.'; exit 1; }
-    exit 0
-fi
-pids="$(helpers)"
-if [[ -n "$pids" ]]; then
-    for pid in $pids; do
-        if [[ "$MODE" == interactive ]]; then
-            ps -p "$pid" -o pid,ppid,stat,etime,args 2>/dev/null || true
-            read -r -p "Stop leftover helper PID $pid? [y/N] " a </dev/tty || true
-            case "$a" in y|Y|yes|YES) ;; *) continue;; esac
-        else
-            printf '  stopping pid %s (dplaysvr.exe)
-' "$pid"
-        fi
-        stop_pid "$pid"
-    done
-fi
-sleep 0.5
-if port_busy && [[ -x "$WINESERVER_BIN" ]]; then
-    WINEPREFIX="$PREFIX" "$WINESERVER_BIN" -k >/dev/null 2>&1 || true
-    for _ in {1..20}; do port_busy || break; sleep 0.5; done
-fi
-if port_busy; then
-    echo 'Port 47624 is still in use.' >&2; exit 1
-fi
-echo 'Port 47624 is free.'
+MULTIPLAYER_PREFLIGHT = r'''import fcntl
+import os
+import signal
+import socket
+import struct
+import sys
+import time
+from pathlib import Path
+
+
+def is_pe32(path):
+    try:
+        with path.open('rb') as f:
+            if f.read(2) != b'MZ':
+                return False
+            f.seek(0x3c)
+            f.seek(struct.unpack('<I', f.read(4))[0])
+            return f.read(6) == b'PE\0\0\x4c\x01'
+    except (OSError, struct.error):
+        return False
+
+
+def owned_processes(prefix):
+    needle = os.fsencode('WINEPREFIX=' + prefix)
+    for proc in Path('/proc').glob('[0-9]*'):
+        try:
+            if proc.stat().st_uid != os.getuid():
+                continue
+            if needle not in (proc / 'environ').read_bytes().split(b'\0'):
+                continue
+            fields = (proc / 'stat').read_text().rsplit(')', 1)[1].split()
+            if fields[0] != 'Z':
+                yield int(proc.name), fields[19], (proc / 'comm').read_text().strip().lower()
+        except (OSError, IndexError):
+            continue
+
+
+def port_status(port, kind):
+    with socket.socket(socket.AF_INET, kind) as sock:
+        try:
+            sock.bind(('0.0.0.0', port))
+        except OSError as exc:
+            import errno
+            return 'busy' if exc.errno == errno.EADDRINUSE else f'unknown ({exc})'
+    return 'available'
+
+
+def main(prefix, slug, udp_port, lock_base):
+    windows = Path(prefix) / 'drive_c/windows/syswow64'
+    missing = [n for n in ('dplayx.dll', 'dpnet.dll', 'dpnhpast.dll', 'dpwsockx.dll') if not is_pe32(windows / n)]
+    if missing:
+        print('Missing or invalid 32-bit DirectPlay DLLs: ' + ', '.join(missing) + '. Rerun the installer.', file=sys.stderr)
+        return 1
+    other = '.game.lock' if slug == 'play-voobly' else '.lobby.lock'
+    with open(lock_base + other, 'a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            other_active = False
+        except BlockingIOError:
+            other_active = True
+        procs = list(owned_processes(prefix))
+        clients = {'voobly.exe', 'age2_x1.exe', 'age2x1.exe', 'age2.exe', 'empires2.exe'}
+        checks = [(47624, socket.SOCK_STREAM, 'TCP'), (47624, socket.SOCK_DGRAM, 'UDP')]
+        if not other_active and not any(name in clients for _, _, name in procs):
+            if any(port_status(port, kind) == 'busy' for port, kind, _ in checks):
+                for pid, born, name in procs:
+                    if name != 'dplaysvr.exe' or (pid, born, name) not in owned_processes(prefix):
+                        continue
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except OSError as exc:
+                        print(f'Could not stop DirectPlay helper {pid}: {exc}', file=sys.stderr)
+                for _ in range(12):
+                    if all(port_status(port, kind) != 'busy' for port, kind, _ in checks):
+                        break
+                    time.sleep(0.25)
+        if slug == 'play-voobly':
+            checks.append((udp_port, socket.SOCK_DGRAM, 'UDP'))
+        for port, kind, proto in dict.fromkeys(checks):
+            status = port_status(port, kind)
+            if status != 'available':
+                print(f'Warning: local IPv4 {proto} {port}: {status}. Unverified processes were not stopped.', file=sys.stderr)
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main(sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]))
 '''
 
 
@@ -1530,7 +1566,12 @@ def configure():
     parser.add_argument('--renderer', choices=('gdi', 'gl'), default='gdi',
                         help='gdi (default): software DirectDraw, no GL needed. gl: Mesa/VirGL (experimental)')
     parser.add_argument('--verbose', '-v', action='store_true', help='Show every command and its output')
+    parser.add_argument('--box64-preset', choices=('default', 'compatibility'), default='default',
+                        help='compatibility disables the dynarec for troubleshooting (slower)')
+    parser.add_argument('--voobly-port', type=int, default=16000, help='UDP port configured in Voobly')
     OPTIONS = parser.parse_args()
+    if not 1 <= OPTIONS.voobly_port <= 65535:
+        parser.error('--voobly-port must be in 1..65535')
     VERBOSE, ROUTE, RENDERER = OPTIONS.verbose, OPTIONS.route, OPTIONS.renderer
 
 
@@ -1617,7 +1658,10 @@ def main():
     if ROUTE == 'box64': ensure_x64_libs(runner)
     wine, _ = install_wrappers(runner, prefix)
     version = check_wine_version(wine, prefix)
-    state.update(wine=str(wine), runner=str(runner), emulator=' '.join(EMU_CMD), version=version); save()
+    state.update(wine=str(wine), runner=str(runner), emulator=' '.join(EMU_CMD), version=version,
+                 runtime_profile={'schema': 1, 'wine_sha256': WINE_SHA256, 'route': ROUTE,
+                                  'renderer': RENDERER, 'box64_preset': OPTIONS.box64_preset,
+                                  'voobly_udp_port': OPTIONS.voobly_port}); save()
 
     stage(4, f'Create a {PREFIX_ARCH} prefix and verify 32-bit Windows execution')
     create_prefix(wine, prefix, state, save)
@@ -1686,10 +1730,7 @@ def main():
     for key, (script, title, rel, args) in launchers.items():
         created[script] = make_launcher(script, title, '', args, runner, prefix, source, drive, rel)
     created['play-voobly'] = make_launcher('play-voobly', 'Voobly', str(voobly), '', runner, prefix, source, drive)
-    helper = DATA / 'tools' / 'clear-directplay-conflict.sh'
-    atomic(helper, PORT_HELPER.replace('@BASH@', str(BASH))
-           .replace('@PREFIX_Q@', shlex.quote(str(prefix)))
-           .replace('@WINESERVER_Q@', shlex.quote(str(DATA / 'bin' / 'wineserver'))), 0o755)
+    atomic(DATA / 'tools' / 'multiplayer-preflight.py', MULTIPLAYER_PREFLIGHT)
     run([BASH, '-n', helper])
     shortcut_names = install_shortcuts(created)
     say('Commands: ' + ', '.join(shortcut_names) + ', aoe2-stop | Termux:Widget entries in ~/.shortcuts', '32')
