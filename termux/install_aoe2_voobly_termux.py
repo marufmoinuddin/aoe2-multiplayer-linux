@@ -1183,21 +1183,8 @@ if command -v flock >/dev/null 2>&1; then
 fi
 HELPER="$BASE/tools/clear-directplay-conflict.sh"
 if [[ -x "$HELPER" ]]; then
-    if ! "$HELPER" --check; then
-        # A confirmed leftover helper for this prefix is the common case after a
-        # closed game; offer to clear it instead of refusing to launch at all.
-        if [[ -t 0 ]]; then
-            printf 'Stop the confirmed leftover DirectPlay helper(s) for this prefix and continue? [y/N] '
-            read -r answer
-            case "$answer" in
-                y|Y|yes|YES) "$HELPER" interactive || { echo "Port 47624 is still occupied." >&2; exit 1; } ;;
-                *) echo "Aborted. Inspect with: $HELPER" >&2; exit 1 ;;
-            esac
-        else
-            echo "Inspect/close existing games first. For confirmed stale helpers run: $HELPER" >&2
-            exit 1
-        fi
-    fi
+    # Force-start: always free port 47624 before launching.
+    "$HELPER" --force || echo "warning: port 47624 is still in use; continuing anyway." >&2
 fi
 ensure_drive() {
     local letter link
@@ -1287,10 +1274,14 @@ echo 'Stopped.'
 '''
 
 PORT_HELPER = r'''#!@BASH@
+# Free TCP/UDP 47624 before launching. Launchers call --force: terminate this
+# user's dplaysvr helpers (TERM then KILL) and restart the prefix's wineserver
+# if the socket survives. No prompts, no grace.
 set -uo pipefail
-MODE="${1:-interactive}"
-case "$MODE" in --check|--auto|interactive) ;; *) echo 'Usage: helper [--check]' >&2; exit 2;; esac
+MODE="${1:---force}"
+case "$MODE" in --check|--force|interactive) ;; *) echo 'Usage: helper [--check|--force|interactive]' >&2; exit 2;; esac
 DEFAULT_PREFIX=@PREFIX_Q@
+WINESERVER_BIN=@WINESERVER_Q@
 PREFIX="${WINEPREFIX:-$DEFAULT_PREFIX}"
 HEXPORT="$(printf '%04X' 47624)"
 # Android 10+ hides /proc/net from apps; when unreadable this reports "free".
@@ -1309,34 +1300,41 @@ helpers() {
         if [[ "$(prefix_of "$pid")" == "$PREFIX" ]]; then echo "$pid"; fi
     done
 }
-if [[ "$MODE" != interactive ]]; then
-    if port_busy; then
-        echo 'Port 47624 is occupied; nothing was stopped. Close active applications, then inspect with:' >&2
-        echo "  $0" >&2
-        exit 1
-    fi
+stop_pid() {
+    local pid=$1 state
+    [[ -O "/proc/$pid" ]] || return 0
+    kill -TERM "$pid" 2>/dev/null || return 0
+    for _ in {1..20}; do [[ -d "/proc/$pid" ]] || return 0; sleep 0.25; done
+    state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || true)"
+    [[ "$state" == Z ]] || kill -KILL "$pid" 2>/dev/null || true
+}
+if [[ "$MODE" == --check ]]; then
+    port_busy && { echo 'Port 47624 is occupied.'; exit 1; }
     exit 0
 fi
 pids="$(helpers)"
-[[ -n "$pids" ]] || { echo 'No leftover dplaysvr.exe helper found for this prefix.'; exit 0; }
-# Never stop a helper while a recognized game or Voobly client is alive.
-for p in /proc/[0-9]*; do
-    [[ -O "$p" && -r "$p/comm" ]] || continue
-    case "$(comm_of "${p#/proc/}")" in
-        empires2.exe|age2_x1.exe|age2.exe|age2x1.exe|voobly.exe)
-            state="$(awk '{print $3}' "$p/stat" 2>/dev/null)"
-            if [[ "$state" != Z ]]; then
-                echo 'Close all games and Voobly clients before terminating helpers.' >&2; exit 1
-            fi;;
-    esac
-done
-for pid in $pids; do
-    [[ "$(comm_of "$pid")" == dplaysvr.exe ]] || continue
-    ps -p "$pid" -o pid,ppid,stat,etime,args 2>/dev/null
-    read -r -p "Stop this confirmed leftover helper? [y/N] " answer </dev/tty
-    case "$answer" in y|Y|yes|YES) kill -TERM "$pid" 2>/dev/null;; esac
-done
-echo 'Done. No game files or network configuration were changed.'
+if [[ -n "$pids" ]]; then
+    for pid in $pids; do
+        if [[ "$MODE" == interactive ]]; then
+            ps -p "$pid" -o pid,ppid,stat,etime,args 2>/dev/null || true
+            read -r -p "Stop leftover helper PID $pid? [y/N] " a </dev/tty || true
+            case "$a" in y|Y|yes|YES) ;; *) continue;; esac
+        else
+            printf '  stopping pid %s (dplaysvr.exe)
+' "$pid"
+        fi
+        stop_pid "$pid"
+    done
+fi
+sleep 0.5
+if port_busy && [[ -x "$WINESERVER_BIN" ]]; then
+    WINEPREFIX="$PREFIX" "$WINESERVER_BIN" -k >/dev/null 2>&1 || true
+    for _ in {1..20}; do port_busy || break; sleep 0.5; done
+fi
+if port_busy; then
+    echo 'Port 47624 is still in use.' >&2; exit 1
+fi
+echo 'Port 47624 is free.'
 '''
 
 
@@ -1507,7 +1505,9 @@ def main():
         created[script] = make_launcher(script, title, '', args, runner, prefix, source, drive, rel)
     created['play-voobly'] = make_launcher('play-voobly', 'Voobly', str(voobly), '', runner, prefix, source, drive)
     helper = DATA / 'tools' / 'clear-directplay-conflict.sh'
-    atomic(helper, PORT_HELPER.replace('@BASH@', str(BASH)).replace('@PREFIX_Q@', shlex.quote(str(prefix))), 0o755)
+    atomic(helper, PORT_HELPER.replace('@BASH@', str(BASH))
+           .replace('@PREFIX_Q@', shlex.quote(str(prefix)))
+           .replace('@WINESERVER_Q@', shlex.quote(str(DATA / 'bin' / 'wineserver'))), 0o755)
     run([BASH, '-n', helper])
     shortcut_names = install_shortcuts(created)
     say('Commands: ' + ', '.join(shortcut_names) + ', aoe2-stop | Termux:Widget entries in ~/.shortcuts', '32')

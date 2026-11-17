@@ -1082,7 +1082,7 @@ def make_icon(exe, ident, title):
     return svg
 
 
-LAUNCHER_TEMPLATE = '#!/usr/bin/env bash\nset -uo pipefail\numask 077\nBASE=@BASE_Q@\nRUNNER=@RUNNER_Q@\nPREFIX=@PREFIX_Q@\nGAME=@GAME_Q@\nDRIVE_PREF=@DRIVE_Q@\nGAME_REL=@REL_Q@\nMARKER=@MARKER_Q@\nFIXED_TARGET=@TARGET_Q@\nPREFIX_ARCH=@ARCH_Q@\nROUTE=@ROUTE_Q@\nTITLE=@TITLE_Q@\nBIN="$BASE/bin"\nLOG="$BASE/logs/@SLUG@-$(date +%Y%m%d-%H%M%S)-$$.log"\n[[ -x "$BIN/wine" && -x "$RUNNER/bin/wine" ]] || { echo \'Wine runner/wrapper missing.\' >&2; exit 1; }\n[[ -f "$PREFIX/system.reg" ]] || { echo \'Prefix missing.\' >&2; exit 1; }\ngrep -q "^#arch=$PREFIX_ARCH\\$" "$PREFIX/system.reg" || { echo \'Wrong prefix architecture.\' >&2; exit 1; }\nfor var in ${!WINE@} ${!BOX64_@} ${!BOX86_@} ${!FEX_@}; do\n    unset "$var"\ndone\nunset LD_PRELOAD LD_LIBRARY_PATH STAGING_WRITECOPY VOOBLY_DLLOVERRIDES\nexport WINE="$BIN/wine" WINESERVER="$BIN/wineserver"\nexport WINEPREFIX="$PREFIX" WINEARCH="$PREFIX_ARCH"\nexport PATH="$BIN:$RUNNER/bin:$PATH"\nexport WINEDLLOVERRIDES=\'winemenubuilder.exe=d\'\nexport WINEDEBUG=\'-all,err+all\'\nif [[ "$ROUTE" == box64 ]]; then\n    export BOX64_NOBANNER=1 BOX64_LD_LIBRARY_PATH=@X64LD_Q@\nfi\nmkdir -p "$BASE/logs"\n# Locks are per shared game directory, not per emulator/prefix.\nLOCKFILE=@LOCK_Q@\nmkdir -p "$(dirname "$LOCKFILE")"\nexec 9>"$LOCKFILE"\nflock -n 9 || { echo \'Another managed game/Voobly launcher is using this game directory.\' >&2; exit 1; }\nHELPER="$BASE/tools/clear-directplay-conflict.sh"\nif [[ -x "$HELPER" ]]; then\n    if ! "$HELPER" --check; then\n        # A confirmed leftover helper for this prefix is the common case after a\n        # closed game; offer to clear it instead of refusing to launch at all.\n        if [[ -t 0 ]]; then\n            printf \'Stop the confirmed leftover DirectPlay helper(s) for this prefix and continue? [y/N] \'\n            read -r answer\n            case "$answer" in\n                y|Y|yes|YES) "$HELPER" interactive || { echo "Port 47624 is still occupied." >&2; exit 1; } ;;\n                *) echo "Aborted. Inspect with: $HELPER" >&2; exit 1 ;;\n            esac\n        else\n            echo "Inspect/close existing games first. For confirmed stale helpers run: $HELPER" >&2\n            exit 1\n        fi\n    fi\nfi\nensure_drive() {\n    local letter link\n    for letter in "$DRIVE_PREF" y x w v u t s r q p o n m l k j i h g f e d; do\n        link="$PREFIX/dosdevices/$letter:"\n        if [[ "$(readlink -f "$link" 2>/dev/null)" == "$(readlink -f "$GAME")" ]]; then\n            printf \'%s:\' "${letter^^}"; return\n        fi\n    done\n    for letter in "$DRIVE_PREF" y x w v u t s r q p o n m l k j i h g f e d; do\n        link="$PREFIX/dosdevices/$letter:"\n        if [[ ! -e "$link" && ! -L "$link" ]]; then\n            ln -s -- "$GAME" "$link" || return 1\n            printf \'%s:\' "${letter^^}"; return\n        fi\n    done\n    return 1\n}\nif [[ -n "$GAME_REL" ]]; then\n    TARGET="$GAME/$GAME_REL"\nelse\n    TARGET="$FIXED_TARGET"\n    DRIVE="$(ensure_drive || true)"\n    if [[ -n "$DRIVE" ]]; then\n        printf \'Game mapping: %s -> %s\\n\' "$DRIVE" "$GAME"\n    else\n        echo \'No spare drive letter; select the game through Z: in Voobly.\' >&2\n    fi\nfi\n[[ -f "$TARGET" ]] || { echo "Missing executable: $TARGET" >&2; exit 1; }\ncd "$GAME" || exit 1\nprintf \'Starting %s via %s without a time limit.\\nLog: %s\\n\' "$TITLE" "$ROUTE" "$LOG"\n"$WINE" "$TARGET" @ARGS@ "$@" 9>&- >"$LOG" 2>&1 &\nchild=$!\n# Sample process mappings to flag accidental fallback to the other emulator.\nsleep 1\nif ! python3 "$BASE/tools/audit-route.py" "$PREFIX" "$ROUTE" >>"$LOG" 2>&1; then\n    echo "Wrong emulator detected. Close the application; inspect $LOG" >&2\nfi\nwait "$child"\nrc=$?\nprintf \'@SLUG@_EXIT=%s\\nLog: %s\\n\' "$rc" "$LOG"\n[[ "$rc" -eq 0 ]] || tail -n 80 "$LOG"\nexit "$rc"\n'
+LAUNCHER_TEMPLATE = '#!/usr/bin/env bash\nset -uo pipefail\numask 077\nBASE=@BASE_Q@\nRUNNER=@RUNNER_Q@\nPREFIX=@PREFIX_Q@\nGAME=@GAME_Q@\nDRIVE_PREF=@DRIVE_Q@\nGAME_REL=@REL_Q@\nMARKER=@MARKER_Q@\nFIXED_TARGET=@TARGET_Q@\nPREFIX_ARCH=@ARCH_Q@\nROUTE=@ROUTE_Q@\nTITLE=@TITLE_Q@\nBIN="$BASE/bin"\nLOG="$BASE/logs/@SLUG@-$(date +%Y%m%d-%H%M%S)-$$.log"\n[[ -x "$BIN/wine" && -x "$RUNNER/bin/wine" ]] || { echo \'Wine runner/wrapper missing.\' >&2; exit 1; }\n[[ -f "$PREFIX/system.reg" ]] || { echo \'Prefix missing.\' >&2; exit 1; }\ngrep -q "^#arch=$PREFIX_ARCH\\$" "$PREFIX/system.reg" || { echo \'Wrong prefix architecture.\' >&2; exit 1; }\nfor var in ${!WINE@} ${!BOX64_@} ${!BOX86_@} ${!FEX_@}; do\n    unset "$var"\ndone\nunset LD_PRELOAD LD_LIBRARY_PATH STAGING_WRITECOPY VOOBLY_DLLOVERRIDES\nexport WINE="$BIN/wine" WINESERVER="$BIN/wineserver"\nexport WINEPREFIX="$PREFIX" WINEARCH="$PREFIX_ARCH"\nexport PATH="$BIN:$RUNNER/bin:$PATH"\nexport WINEDLLOVERRIDES=\'winemenubuilder.exe=d\'\nexport WINEDEBUG=\'-all,err+all\'\nif [[ "$ROUTE" == box64 ]]; then\n    export BOX64_NOBANNER=1 BOX64_LD_LIBRARY_PATH=@X64LD_Q@\nfi\nmkdir -p "$BASE/logs"\n# Locks are per shared game directory, not per emulator/prefix.\nLOCKFILE=@LOCK_Q@\nmkdir -p "$(dirname "$LOCKFILE")"\nexec 9>"$LOCKFILE"\nflock -n 9 || { echo \'Another managed game/Voobly launcher is using this game directory.\' >&2; exit 1; }\nHELPER="$BASE/tools/clear-directplay-conflict.sh"\nif [[ -x "$HELPER" ]]; then\n    # Force-start: always free port 47624 before launching.\n    "$HELPER" --force || echo "warning: port 47624 is still in use; continuing anyway." >&2\nfi\nensure_drive() {\n    local letter link\n    for letter in "$DRIVE_PREF" y x w v u t s r q p o n m l k j i h g f e d; do\n        link="$PREFIX/dosdevices/$letter:"\n        if [[ "$(readlink -f "$link" 2>/dev/null)" == "$(readlink -f "$GAME")" ]]; then\n            printf \'%s:\' "${letter^^}"; return\n        fi\n    done\n    for letter in "$DRIVE_PREF" y x w v u t s r q p o n m l k j i h g f e d; do\n        link="$PREFIX/dosdevices/$letter:"\n        if [[ ! -e "$link" && ! -L "$link" ]]; then\n            ln -s -- "$GAME" "$link" || return 1\n            printf \'%s:\' "${letter^^}"; return\n        fi\n    done\n    return 1\n}\nif [[ -n "$GAME_REL" ]]; then\n    TARGET="$GAME/$GAME_REL"\nelse\n    TARGET="$FIXED_TARGET"\n    DRIVE="$(ensure_drive || true)"\n    if [[ -n "$DRIVE" ]]; then\n        printf \'Game mapping: %s -> %s\\n\' "$DRIVE" "$GAME"\n    else\n        echo \'No spare drive letter; select the game through Z: in Voobly.\' >&2\n    fi\nfi\n[[ -f "$TARGET" ]] || { echo "Missing executable: $TARGET" >&2; exit 1; }\ncd "$GAME" || exit 1\nprintf \'Starting %s via %s without a time limit.\\nLog: %s\\n\' "$TITLE" "$ROUTE" "$LOG"\n"$WINE" "$TARGET" @ARGS@ "$@" 9>&- >"$LOG" 2>&1 &\nchild=$!\n# Sample process mappings to flag accidental fallback to the other emulator.\nsleep 1\nif ! python3 "$BASE/tools/audit-route.py" "$PREFIX" "$ROUTE" >>"$LOG" 2>&1; then\n    echo "Wrong emulator detected. Close the application; inspect $LOG" >&2\nfi\nwait "$child"\nrc=$?\nprintf \'@SLUG@_EXIT=%s\\nLog: %s\\n\' "$rc" "$LOG"\n[[ "$rc" -eq 0 ]] || tail -n 80 "$LOG"\nexit "$rc"\n'
 
 
 def make_launcher(slug, title, target, args, runner, prefix, source, drive, fex, rel='', marker=''):
@@ -1119,7 +1119,60 @@ def menu_entry(slug, title, launcher, icon, ident, source):
     return file
 
 
-PORT_HELPER = '#!/usr/bin/env bash\nset -euo pipefail\nMODE="${1:-interactive}"\ncase "$MODE" in --check|--auto|interactive) ;; *) echo \'Usage: helper [--check]\' >&2; exit 2;; esac\nDEFAULT_PREFIX=@PREFIX_Q@\nPREFIX="${WINEPREFIX:-$DEFAULT_PREFIX}"\ncommand -v ss >/dev/null || { echo \'ss is required (iproute2/iproute).\' >&2; exit 1; }\nsockets() { ss -H -lntup \'sport = :47624\'; }\ncurrent="$(sockets)"\n[[ -n "$current" ]] || exit 0\nprintf \'Port 47624 is occupied; an owner is not automatically stale:\\n%s\\n\' "$current"\nif [[ "$MODE" != interactive ]]; then\n    echo \'No process was stopped. Close active applications and inspect the helper manually.\' >&2\n    exit 1\nfi\nprefix_of() { tr \'\\0\' \'\\n\' <"/proc/$1/environ" 2>/dev/null | sed -n \'s/^WINEPREFIX=//p\'; }\nstart_of() { sed \'s/^.*) //\' "/proc/$1/stat" | awk \'{print $20}\'; }\nvalid() {\n    local pid="$1"\n    [[ -O "/proc/$pid" && -r "/proc/$pid/comm" ]] || return 1\n    [[ "$(tr \'[:upper:]\' \'[:lower:]\' <"/proc/$pid/comm")" == dplaysvr.exe ]] || return 1\n    [[ "$(prefix_of "$pid")" == "$PREFIX" ]] || return 1\n}\n# Never terminate a helper while a recognized live game or Voobly client exists, in any prefix.\nfor p in /proc/[0-9]*; do\n    [[ -O "$p" && -r "$p/comm" ]] || continue\n    name="$(tr \'[:upper:]\' \'[:lower:]\' <"$p/comm" 2>/dev/null || true)"\n    case "$name" in\n        empires2.exe|age2_x1.exe|age2.exe|age2x1.exe|voobly.exe)\n            state="$(awk \'{print $3}\' "$p/stat" 2>/dev/null || true)"\n            if [[ "$state" != Z ]]; then\n                echo \'Close all games and Voobly clients before terminating helpers.\' >&2; exit 1\n            fi;;\n    esac\ndone\nfor pid in $(printf \'%s\\n\' "$current" | grep -o \'pid=[0-9]*\' | cut -d= -f2 | sort -u); do\n    valid "$pid" || continue\n    start="$(start_of "$pid")"\n    ps -p "$pid" -o pid,ppid,user,stat,etime,args\n    read -r -p "Stop this confirmed leftover helper in $PREFIX? [y/N] " answer </dev/tty\n    case "$answer" in y|Y|yes|YES) ;; *) continue;; esac\n    valid "$pid" && [[ "$(start_of "$pid")" == "$start" ]] || continue\n    kill -TERM "$pid" 2>/dev/null || true\n    for _ in {1..10}; do\n        [[ -d "/proc/$pid" ]] || break\n        sleep 1\n    done\n    if valid "$pid" && [[ "$(start_of "$pid")" == "$start" ]]; then\n        state="$(awk \'{print $3}\' "/proc/$pid/stat" 2>/dev/null || true)"\n        if [[ "$state" != Z ]]; then\n            read -r -p "Same helper remains. Force-stop PID $pid? [y/N] " answer </dev/tty\n            case "$answer" in\n                y|Y|yes|YES)\n                    valid "$pid" && [[ "$(start_of "$pid")" == "$start" ]] && kill -KILL "$pid" || true;;\n            esac\n        fi\n    fi\ndone\nsleep 1\nleft="$(sockets)"\n[[ -z "$left" ]] || { printf \'Port remains occupied:\\n%s\\n\' "$left"; exit 1; }\necho \'Port 47624 is free. No game files or network configuration were changed.\'\n'
+PORT_HELPER = r'''#!/usr/bin/env bash
+# Free TCP/UDP 47624 for DirectPlay before launching. Launchers call --force,
+# which terminates every process of this user holding the port and restarts the
+# prefix's wineserver if it still shares an inherited socket.
+set -uo pipefail
+MODE="${1:---force}"
+case "$MODE" in --check|--force|interactive) ;; *) echo 'Usage: helper [--check|--force|interactive]' >&2; exit 2;; esac
+DEFAULT_PREFIX=@PREFIX_Q@
+WINESERVER_BIN=@WINESERVER_Q@
+PREFIX="${WINEPREFIX:-$DEFAULT_PREFIX}"
+command -v ss >/dev/null || { echo 'ss is required (iproute2/iproute).' >&2; exit 1; }
+sockets() { ss -H -lntup 'sport = :47624'; }
+current="$(sockets)"
+[[ -n "$current" ]] || exit 0
+printf 'Port 47624 is occupied:
+%s
+' "$current"
+[[ "$MODE" == --check ]] && exit 1
+pids() { printf '%s
+' "$1" | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u; }
+stop_pid() {
+    local pid=$1 state
+    [[ -O "/proc/$pid" ]] || return 0
+    kill -TERM "$pid" 2>/dev/null || return 0
+    for _ in {1..20}; do [[ -d "/proc/$pid" ]] || return 0; sleep 0.25; done
+    state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || true)"
+    [[ "$state" == Z ]] || kill -KILL "$pid" 2>/dev/null || true
+}
+for pid in $(pids "$current"); do
+    if [[ "$MODE" == interactive ]]; then
+        ps -p "$pid" -o pid,ppid,user,stat,etime,args || true
+        read -r -p "Stop PID $pid? [y/N] " a </dev/tty || true
+        case "$a" in y|Y|yes|YES) ;; *) continue;; esac
+    else
+        printf '  stopping pid %s (%s)
+' "$pid" "$(cat "/proc/$pid/comm" 2>/dev/null || echo '?')"
+    fi
+    stop_pid "$pid"
+done
+sleep 0.5
+left="$(sockets)"
+if [[ -n "$left" && -x "$WINESERVER_BIN" ]]; then
+    # wineserver keeps inherited socket fds; restart this prefix's server.
+    WINEPREFIX="$PREFIX" "$WINESERVER_BIN" -k >/dev/null 2>&1 || true
+    for _ in {1..20}; do [[ -n "$(sockets)" ]] || break; sleep 0.5; done
+fi
+left="$(sockets)"
+if [[ -n "$left" ]]; then
+    printf 'Port 47624 still in use:
+%s
+' "$left"; exit 1
+fi
+echo 'Port 47624 is free.'
+'''
 
 
 def attach_terminal():
@@ -1345,7 +1398,8 @@ def main():
         run(['update-desktop-database', APPS], check=False)
 
     helper = DATA / 'tools' / 'clear-directplay-conflict.sh'
-    atomic(helper, PORT_HELPER.replace('@PREFIX_Q@', shlex.quote(str(prefix))), 0o755)
+    atomic(helper, PORT_HELPER.replace('@PREFIX_Q@', shlex.quote(str(prefix)))
+           .replace('@WINESERVER_Q@', shlex.quote(str(DATA / 'bin' / 'wineserver'))), 0o755)
 
     stage(8, 'Final checks')
     say('Each application can be opened for a real smoke test; close it normally afterwards.\n'
