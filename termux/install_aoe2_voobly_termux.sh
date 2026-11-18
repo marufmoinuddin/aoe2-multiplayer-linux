@@ -1117,6 +1117,21 @@ What has and has not been verified with this setup
 EOF
 }
 
+# The header comment doubles as --help text. When the script arrives via a pipe
+# there is no file to re-read, so fall back to a short usage line.
+show_help() {
+    local src="${BASH_SOURCE[0]:-}"
+    if [ -n "$src" ] && [ -f "$src" ]; then
+        sed -n '3,/^# =====/p' "$src" | sed '$d' | sed 's/^# \{0,1\}//'
+    else
+        printf '%s\n' \
+            "Usage: bash install.sh [--game DIR] [--game-mode copy|root|keep]" \
+            "                       [--voobly-setup FILE] [--prefix DIR] [--res WxH]" \
+            "                       [--directplay] [--reset-prefix] [--reinstall-hangover] [--yes]" \
+            "Run the downloaded file directly for the full description."
+    fi
+}
+
 parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1131,7 +1146,7 @@ parse_args() {
             --reset-prefix)       RESET_PREFIX=1; shift ;;
             --reinstall-hangover) REINSTALL_HANGOVER=1; shift ;;
             --yes|-y)             ASSUME_YES=1; shift ;;
-            -h|--help)            sed -n '3,/^# =====/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
+            -h|--help)            show_help; exit 0 ;;
             *) die "Unknown option: $1" ;;
         esac
     done
@@ -1154,4 +1169,6 @@ main() {
     stage_final
 }
 
-if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi
+# Run when executed as a file ($0 == BASH_SOURCE) or piped in (BASH_SOURCE empty);
+# stay quiet when sourced from another script.
+if [ -z "${BASH_SOURCE[0]:-}" ] || [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

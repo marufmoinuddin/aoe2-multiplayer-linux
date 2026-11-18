@@ -17,10 +17,11 @@ curl -fsSL https://raw.githubusercontent.com/marufmoinuddin/aoe2-multiplayer-lin
 **Android / Termux** (after installing the [Termux:X11](https://github.com/termux/termux-x11/releases) app):
 
 ```bash
-pkg update && pkg upgrade -y && pkg install -y curl && curl -fsSL https://raw.githubusercontent.com/marufmoinuddin/aoe2-multiplayer-linux/main/termux/install_aoe2_voobly_termux.sh | bash
+pkg update && pkg upgrade -y && pkg install -y curl && curl -fsSL -o install.sh https://raw.githubusercontent.com/marufmoinuddin/aoe2-multiplayer-linux/main/termux/install_aoe2_voobly_termux.sh && bash install.sh
 ```
 
-Both are interactive and resumable; prompts work even though the script arrives via a pipe.
+Both are interactive and resumable; the Termux installer is saved as `install.sh`
+first, and prompts work even though the Linux one arrives via a pipe.
 More options (verbose mode, emulator route, GPU mode, DirectDraw renderer) are below.
 
 ## What it does
@@ -106,10 +107,10 @@ Your original game directory and system Wine installation are never replaced.
 An Android port lives in [termux/](termux/) — a Bash installer for Termux +
 Termux:X11 that keeps the same layout (Hangover Wine for ARM64 with the FEX
 wow64 module, one shared `win64` prefix, Winetricks DirectPlay, Voobly and the
-`aoe2-voobly` launcher). Pass options after `bash -s --`:
+`aoe2-voobly` launcher). Pass options to `install.sh`:
 
 ```bash
-pkg update && pkg upgrade -y && pkg install -y curl && curl -fsSL https://raw.githubusercontent.com/marufmoinuddin/aoe2-multiplayer-linux/main/termux/install_aoe2_voobly_termux.sh | bash -s -- --res 1280x720 --directplay
+pkg update && pkg upgrade -y && pkg install -y curl && curl -fsSL -o install.sh https://raw.githubusercontent.com/marufmoinuddin/aoe2-multiplayer-linux/main/termux/install_aoe2_voobly_termux.sh && bash install.sh --res 1280x720 --directplay
 ```
 
 Local checkout: `bash termux/install_aoe2_voobly_termux.sh`.
