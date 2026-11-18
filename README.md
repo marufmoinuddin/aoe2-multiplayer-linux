@@ -104,20 +104,19 @@ Your original game directory and system Wine installation are never replaced.
 ## Android (Termux)
 
 An Android port lives in [termux/](termux/) — a Bash installer for Termux +
-Termux:X11 that keeps the same architecture (Wine 10.0 amd64-wow64, one shared
-`win64` prefix, Winetricks DirectPlay, Voobly, `play-*` launchers) inside a
-proot-distro Ubuntu glibc container with Box64.
-Install it with the one-liner in **Quick install** above; passed options:
+Termux:X11 that keeps the same layout (Hangover Wine for ARM64 with the FEX
+wow64 module, one shared `win64` prefix, Winetricks DirectPlay, Voobly and the
+`aoe2-voobly` launcher). Pass options after `bash -s --`:
 
 ```bash
-pkg install -y curl && curl -fsSL https://raw.githubusercontent.com/marufmoinuddin/aoe2-multiplayer-linux/main/termux/install-aoe2-voobly.sh | bash -s -- --gpu=virgl --ddraw=cnc
+pkg update && pkg upgrade -y && pkg install -y curl && curl -fsSL https://raw.githubusercontent.com/marufmoinuddin/aoe2-multiplayer-linux/main/termux/install_aoe2_voobly_termux.sh | bash -s -- --res 1280x720 --directplay
 ```
 
-Local checkout: `bash termux/install-aoe2-voobly.sh`.
+Local checkout: `bash termux/install_aoe2_voobly_termux.sh`.
 
-See [termux/README.md](termux/README.md) for requirements (Termux:X11 APK),
-the GPU matrix (VirGL on Adreno, llvmpipe fallback elsewhere, no DXVK — classic
-AoE II is a DirectDraw game) and what still needs on-device verification.
+See `bash termux/install_aoe2_voobly_termux.sh --help` for the option list
+(game folder, game mode, prefix, resolution, DirectPlay) and the on-device
+steps. The installer is resumable: rerunning it skips completed stages.
 
 ## Uninstalling
 

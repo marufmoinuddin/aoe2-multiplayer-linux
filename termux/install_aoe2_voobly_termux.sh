@@ -550,7 +550,18 @@ stage_preflight() {
         # shellcheck disable=SC2046
         pkg install -y $(printf '%s\n' "${need[@]}" | sort -u) 2>&1 | tee -a "$LOG"
     fi
-    command -v curl >/dev/null 2>&1 || die "curl is required."
+    command -v curl >/dev/null 2>&1 || pkg install -y curl 2>&1 | tee -a "$LOG"
+    if ! curl --version >/dev/null 2>&1; then
+        # A partial `pkg upgrade` leaves the new libcurl next to an old OpenSSL, so the
+        # binary is present but cannot link (e.g. "cannot locate symbol SSL_set_...").
+        warn "curl is installed but cannot run (usually a partial Termux upgrade: new libcurl + old OpenSSL)."
+        yes_no "Upgrade OpenSSL and curl now to fix it?" y || die "Run 'pkg update && pkg upgrade -y', then rerun this installer."
+        pkg update -y 2>&1 | tee -a "$LOG" || warn "'pkg update' reported an error; still trying the upgrade."
+        pkg install -y openssl curl 2>&1 | tee -a "$LOG" || warn "'pkg install openssl curl' reported an error."
+        hash -r
+    fi
+    curl --version >/dev/null 2>&1 ||
+        die "curl still cannot run. Run 'pkg update && pkg upgrade -y', restart Termux, then rerun this installer."
     command -v python3 >/dev/null 2>&1 ||
         warn "python3 not installed: port checks and the executable-storage test are less exact (pkg install python)."
     ok "Termux, ARM64 and storage access look fine."
