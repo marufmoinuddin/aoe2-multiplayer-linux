@@ -320,6 +320,17 @@ aoe_port_clear() {
 }
 
 # ----------------------------------------------------- display / audio / GL ---
+# 0 when an X11 server answers on DISPLAY=:0. With no probe available we assume it is
+# fine, so a missing helper never blocks a launch.
+x11_ready() {
+    local sock
+    for sock in "${XDG_RUNTIME_DIR:-$PREFIX/tmp}/.X11-unix/X0" "$PREFIX/tmp/.X11-unix/X0"; do
+        [ -S "$sock" ] && return 0
+    done
+    command -v xrandr >/dev/null 2>&1 || return 0
+    bounded 10 xrandr >/dev/null 2>&1
+}
+
 aoe_display() {
     export XDG_RUNTIME_DIR="${TMPDIR:-$PREFIX/tmp}"
     export DISPLAY=:0
@@ -327,9 +338,16 @@ aoe_display() {
         aoe_say "Starting Termux:X11 ..."
         command -v termux-x11 >/dev/null 2>&1 || { aoe_warn "termux-x11 command missing (pkg install termux-x11-nightly)."; return 1; }
         (termux-x11 :0 >/dev/null 2>&1 &)
-        sleep 3
     fi
-    am start --user 0 -n com.termux.x11/com.termux.x11.MainActivity >/dev/null 2>&1 || true
+    am start --user 0 -n com.termux.x11/com.termux.x11.MainActivity >/dev/null 2>&1 ||
+        aoe_warn "Could not open the Termux:X11 app (is it installed?)."
+    # Wine GUI programs fail immediately when the server is not up yet.
+    local i
+    for i in $(seq 1 30); do
+        x11_ready && return 0
+        sleep 1
+    done
+    return 1
 }
 
 aoe_audio() {
@@ -750,7 +768,7 @@ stage_voobly() {
     stage 6 "Install Voobly"
     local found="" setup="" g
     if [ -n "${VOOBLY_EXE:-}" ] && [ -f "$VOOBLY_EXE" ]; then found=$VOOBLY_EXE
-    else found="$(find_ci "$WINEPREFIX/drive_c" voobly.exe 5)"; fi
+    else found="$(find_ci "$WINEPREFIX/drive_c" voobly.exe 8)"; fi
 
     if [ -z "$found" ]; then
         if [ -n "$SETUP_ARG" ]; then setup=$(clean_path "$SETUP_ARG")
@@ -766,11 +784,29 @@ stage_voobly() {
         say "destination, and UNCHECK 'Launch Voobly' at the end."
         yes_no "Start the Voobly installer now?" y || die "Voobly installation declined."
         aoe_display; aoe_audio; aoe_virgl
-        local rc; ( cd "$(dirname "$setup")" && mwine "$setup" ) >>"$LOG" 2>&1; rc=$?
-        [ "$rc" -eq 0 ] || die "The Voobly installer exited with status $rc."
-        bounded 300 mwine wineboot -u >>"$LOG" 2>&1
-        found="$(find_ci "$WINEPREFIX/drive_c" voobly.exe 5)"
-        [ -n "$found" ] || die "voobly.exe not found in the container; the installer was cancelled or used another drive."
+        if ! x11_ready; then
+            warn "No X11 display answers on DISPLAY=:0, so Wine cannot open windows."
+            say  "Open the Termux:X11 app and leave its window in front, then answer y."
+            yes_no "Start the Voobly installer anyway?" y || die "Cancelled; rerun once Termux:X11 shows a window."
+        fi
+        local ilog="$LOGS/voobly-setup-$STAMP.log" rc=1 attempt
+        for attempt in 1 2; do
+            say "Running the Voobly installer (attempt $attempt/2) ..."
+            : >"$ilog"
+            ( cd "$(dirname "$setup")" && mwine "$setup" ) >>"$ilog" 2>&1; rc=$?
+            bounded 300 mwine wineboot -u >>"$LOG" 2>&1
+            found="$(find_ci "$WINEPREFIX/drive_c" voobly.exe 8)"
+            [ -n "$found" ] && break
+            [ "$rc" -eq 0 ] && break
+            [ "$attempt" -lt 2 ] && { warn "Installer stopped early (status $rc); retrying once."; sleep 5; }
+        done
+        if [ -z "$found" ]; then
+            say "The installer log ($ilog) ends with:"
+            tail -n 30 "$ilog" | sed 's/^/  /'
+            grep -Eqi 'x11drv|open display|connect.*display' "$ilog" &&
+                say "  Wine could not reach Termux:X11: open its app and keep it in front, then rerun."
+            die "Voobly was not installed (installer status $rc). Post the lines above, or check $LOG."
+        fi
     else
         ok "Voobly is already installed."
     fi
