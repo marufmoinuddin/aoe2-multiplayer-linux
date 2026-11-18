@@ -305,6 +305,27 @@ setup_pids() {
     done
 }
 
+# One-line state of every Voobly installer process plus the X window list. CPU ticks
+# rising = executing (slow emulation or a spin); flat ticks with state S = blocked.
+# Written into the installer log at the 30s/2min heartbeats, and available on demand
+# as `aoe2-voobly diag`.
+aoe_setup_snapshot() {
+    local p found=0
+    for p in $(setup_pids); do
+        found=1
+        printf '  pid %s state=%s ticks=%s\n' "$p" \
+            "$(awk '/^State:/{print $2}' "/proc/$p/status" 2>/dev/null)" \
+            "$(awk '{print $14 + $15}' "/proc/$p/stat" 2>/dev/null)"
+    done
+    [ "$found" = 1 ] || printf '  no Voobly installer process\n'
+    if command -v xwininfo >/dev/null 2>&1; then
+        DISPLAY=:0 xwininfo -root -tree 2>/dev/null |
+            grep -i -E 'voobly|inno|setup' || printf '  no installer window on DISPLAY=:0\n'
+    else
+        printf '  xwininfo not installed (pkg install xorg-xwininfo)\n'
+    fi
+}
+
 # Normal prefix shutdown first, then TERM/KILL for whatever is left.
 aoe_stop_wine() {
     local pid
@@ -509,6 +530,7 @@ Usage: aoe2-voobly <command> [game arguments]
   stop         stop every Wine process of this prefix
   status       show drive link, port and running processes
   logs [N]     show the tail (N lines, default 40) of the newest logs
+  diag         installer processes (state, CPU ticks) and the X window list
   mount-game   (root mode) bind-mount the game folder now
   umount-game  (root mode) stop Wine and unmount the game folder
   wine ARGS    run Hangover's wine with this prefix (e.g. wine winecfg)
@@ -611,6 +633,10 @@ case "$cmd" in
             tail -n "$n" "$f"
             aoe_say ""
         done ;;
+    diag)
+        aoe_say "Prefix    : $WINEPREFIX"
+        aoe_say "Emulator  : ${AOE_EMU:-fex}  (HODLL=${HODLL:-unset})"
+        aoe_setup_snapshot ;;
     status)
         aoe_say "Prefix    : $WINEPREFIX"
         aoe_say "Wine      : $("$HANGOVER_BIN/wine" --version 2>/dev/null)"
@@ -1182,16 +1208,13 @@ stage_voobly() {
         else
             modes=(dynarec)
         fi
-        # A VooblySetup.exe left over from an earlier attempt keeps running inside the
-        # prefix, and Inno Setup allows only one live instance, so it would hold the
-        # next attempt hostage. Close only those installer processes - not the whole
-        # prefix - because the extracted copy may be the window the user is using.
-        local stale
-        stale="$(setup_pids)"
-        if [ -n "$stale" ]; then
-            say "Closing leftover Voobly installer process(es): $(echo $stale)"
-            for pid in $stale; do kill -TERM "$pid" 2>/dev/null; done
-            sleep 2
+        # Start every attempt from a clean wineserver. A half-dead one - or an installer left
+        # over from an interrupted run - can stall a fresh attempt, and this is the only
+        # point where nothing of ours should be running yet. Everything later in this
+        # stage only ever kills the installer's own processes, so an open window survives.
+        if [ -n "$(setup_pids)" ] || [ -n "$(hf_wine_pids)" ]; then
+            say "Stopping this prefix's Wine first, so the installer starts from a clean wineserver ..."
+            aoe_stop_wine >>"$LOG" 2>&1 || true
             for pid in $(setup_pids); do kill -KILL "$pid" 2>/dev/null; done
         fi
         for mode in "${modes[@]}"; do
@@ -1226,12 +1249,15 @@ stage_voobly() {
                 sleep 10
                 waited=$((waited + 10))
                 case "$waited" in
-                    30)  say "  still starting (30s). No window? Open the Termux:X11 app and keep it in front." ;;
-                    120) say "  still running (2 min); the emulator is slow, the log keeps growing." ;;
-                    300) say "  still running (5 min)." ;;
+                    30)  say "  still starting (30s). No window? Open the Termux:X11 app and keep it in front."
+                         { echo "  [30s]"; aoe_setup_snapshot; } >>"$ilog" 2>&1 ;;
+                    120) say "  still running (2 min); the emulator is slow, the log keeps growing."
+                         { echo "  [2min]"; aoe_setup_snapshot; } >>"$ilog" 2>&1 ;;
+                    300) say "  still running (5 min)."
+                         { echo "  [5min]"; aoe_setup_snapshot; } >>"$ilog" 2>&1 ;;
                 esac
                 if [ "$waited" -ge "$limit" ]; then
-                    warn "No result after $((limit / 60)) minutes; stopping this attempt and trying the next one."
+                    warn "No result after $(( (limit + 59) / 60 )) minute(s); stopping this attempt and trying the next one."
                     say  "  (Set AOE_SETUP_TIMEOUT=1800 to allow longer, or AOE_BOX64_LOG=1 for Box64 detail.)"
                     kill -TERM "$pid" 2>/dev/null; sleep 2; kill -KILL "$pid" 2>/dev/null
                     for pid in $(setup_pids); do kill -KILL "$pid" 2>/dev/null; done
