@@ -110,7 +110,7 @@ wow64 module, one shared `win64` prefix, Winetricks DirectPlay, Voobly and the
 `aoe2-voobly` launcher). Pass options to `install.sh`:
 
 ```bash
-pkg update && pkg upgrade -y && pkg install -y curl && curl -fsSL -o install.sh https://raw.githubusercontent.com/marufmoinuddin/aoe2-multiplayer-linux/main/termux/install_aoe2_voobly_termux.sh && bash install.sh --res 1280x720 --directplay
+pkg update && pkg upgrade -y && pkg install -y curl && curl -fsSL -o install.sh https://raw.githubusercontent.com/marufmoinuddin/aoe2-multiplayer-linux/main/termux/install_aoe2_voobly_termux.sh && bash install.sh --directplay
 ```
 
 Local checkout: `bash termux/install_aoe2_voobly_termux.sh`.
