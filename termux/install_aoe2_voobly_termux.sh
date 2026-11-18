@@ -215,6 +215,17 @@ mwineserver() {
     env -u LD_PRELOAD "$GLIBC_BIN/box64" "$GLIBC_BIN/wineserver" "$@"
 }
 
+# Box64's dynamic recompiler miscompiles some Delphi code: Voobly's installer aborts
+# with an EAbstractError (0x0EEDFADE). The interpreter runs the same code correctly,
+# only slower. The empty rcfile keeps a user box64rc from turning dynarec back on.
+mwine_interp() {
+    local rc="$AOE_BASE/box64-interp.rc" rc2
+    : >"$rc"
+    ( export BOX64_DYNAREC=0 BOX64_RCFILE="$rc"; mwine "$@" )
+    rc2=$?
+    return "$rc2"
+}
+
 # ---------------------------------------------------------- process control ---
 mb_self_chain() {
     local p=${BASHPID:-$$}
@@ -410,6 +421,7 @@ usage() {
     cat <<EOF
 Usage: aoe2-voobly <command> [game arguments]
   voobly       start Voobly (log in, then launch games from Voobly)
+  voobly-interp  same, with Box64's interpreter (if Voobly crashes under dynarec)
   aoe2         start The Conquerors directly (-nostartup)
   aok          start the Age of Kings executable directly
   clear-port   free TCP/UDP $PORT now
@@ -418,8 +430,8 @@ Usage: aoe2-voobly <command> [game arguments]
 EOF
 }
 
-launch() {   # launch LABEL UNIX_EXE WIN_EXE [args...]
-    local label=$1 exe=$2 winexe=$3 logf rc; shift 3
+launch() {   # launch LABEL RUNNER UNIX_EXE WIN_EXE [args...]
+    local label=$1 runner=$2 exe=$3 winexe=$4 logf rc; shift 4
     [ -f "$exe" ] || { aoe_warn "Missing executable: $exe  (rerun the installer)"; exit 1; }
     if command -v flock >/dev/null 2>&1; then
         exec 9>"$AOE_BASE/launch.lock"
@@ -434,7 +446,7 @@ launch() {   # launch LABEL UNIX_EXE WIN_EXE [args...]
     aoe_say "Starting $label. Log: $logf"
     aoe_say "Open the Termux:X11 app to see the window."
     trap 'aoe_stop_wine; command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock; exit 130' INT TERM
-    mwine "$winexe" "$@" 9>&- >"$logf" 2>&1 &
+    "$runner" "$winexe" "$@" 9>&- >"$logf" 2>&1 &
     wait $!
     rc=$?
     command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock
@@ -445,9 +457,10 @@ launch() {   # launch LABEL UNIX_EXE WIN_EXE [args...]
 
 cmd=${1:-help}; [ $# -gt 0 ] && shift
 case "$cmd" in
-    voobly)       launch voobly "$VOOBLY_EXE" "$VOOBLY_EXE" "$@" ;;
-    aoe2|aoc)     launch aoe2 "$GAME_DIR/$AOC_REL" "$GAME_PATH\\${AOC_REL//\//\\}" -nostartup "$@" ;;
-    aok)          launch aok "$GAME_DIR/$AOK_REL" "$GAME_PATH\\${AOK_REL//\//\\}" "$@" ;;
+    voobly)       launch voobly mwine "$VOOBLY_EXE" "$VOOBLY_EXE" "$@" ;;
+    voobly-interp) launch voobly mwine_interp "$VOOBLY_EXE" "$VOOBLY_EXE" "$@" ;;
+    aoe2|aoc)     launch aoe2 mwine "$GAME_DIR/$AOC_REL" "$GAME_PATH\\${AOC_REL//\//\\}" -nostartup "$@" ;;
+    aok)          launch aok mwine "$GAME_DIR/$AOK_REL" "$GAME_PATH\\${AOK_REL//\//\\}" "$@" ;;
     clear-port)   aoe_port_clear ;;
     stop)         aoe_stop_wine && aoe_say "Wine processes of this container stopped." ;;
     status)
@@ -791,9 +804,10 @@ stage_voobly() {
         fi
         local ilog="$LOGS/voobly-setup-$STAMP.log" rc=1 attempt
         for attempt in 1 2; do
-            say "Running the Voobly installer (attempt $attempt/2) ..."
+            say "Running the Voobly installer with Box64's interpreter (attempt $attempt/2) ..."
+            say "  Delphi installers crash under Box64's dynarec; the interpreter is slower but correct."
             : >"$ilog"
-            ( cd "$(dirname "$setup")" && mwine "$setup" ) >>"$ilog" 2>&1; rc=$?
+            ( cd "$(dirname "$setup")" && mwine_interp "$setup" ) >>"$ilog" 2>&1; rc=$?
             bounded 300 mwine wineboot -u >>"$LOG" 2>&1
             found="$(find_ci "$WINEPREFIX/drive_c" voobly.exe 8)"
             [ -n "$found" ] && break
@@ -846,6 +860,7 @@ $(_c '1;32')INSTALLATION PREPARED$(_c 0)
 
 Commands
   aoe2-voobly voobly      start Voobly
+  aoe2-voobly voobly-interp  start Voobly with Box64's interpreter (if it crashes under dynarec)
   aoe2-voobly aoe2        start The Conquerors directly
   aoe2-voobly clear-port  free TCP/UDP $PORT
   aoe2-voobly stop        stop all Wine processes of this container
