@@ -117,7 +117,9 @@ Local checkout: `bash termux/install_aoe2_voobly_termux.sh`.
 
 See `bash termux/install_aoe2_voobly_termux.sh --help` for the option list
 (game folder, game mode, prefix, resolution, DirectPlay) and the on-device
-steps. The installer is resumable: rerunning it skips completed stages.
+steps. The installer is resumable: rerunning it skips completed stages. To set
+the window size pass `--res WIDTHxHEIGHT` (default `1280x720`) — see
+**Troubleshooting** below.
 
 ## Uninstalling
 
@@ -158,6 +160,29 @@ Never kill *every* `dplaysvr.exe`, and don't change DirectPlay settings repeated
 **Where are the logs?** Every run writes a timestamped log plus a `*-summary.json` report to `~/.local/share/aoe2-multiplayer-linux/logs/`. Failed runs print the log path.
 
 **Wayland-only session.** Wine may need a working XWayland, or its Wayland driver configured.
+
+**Termux window is stuck at 1280×720.** The game and Voobly run inside a Wine
+*virtual desktop* whose size comes from `--res` (default `1280x720`) — resizing
+the Termux:X11 window does **not** resize it.
+
+If you have **already installed**, you do not need to rerun the installer. The
+saved value is re-read on every launch, so just edit it:
+
+```bash
+sed -i 's/^AOE_RES=.*/AOE_RES=1920x1080/' ~/.local/share/aoe2-fex/state.env
+```
+
+Or override it for a single run:
+
+```bash
+AOE_RES=1920x1080 aoe2-voobly aoe2
+```
+
+For a fresh install (or a rerun) pass the size to the installer instead:
+
+```bash
+bash install.sh --res 1920x1080
+```
 
 **Launcher and port 47624.** Launching always force-frees the port first: the
 launcher terminates whatever of yours is holding TCP/UDP 47624 (a leftover

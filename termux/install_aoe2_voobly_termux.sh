@@ -1155,7 +1155,11 @@ parse_args() {
 main() {
     parse_args "$@"
     : >"$LOG"
+    # --res comes from parse_args, but the saved state below would overwrite it;
+    # keep the CLI value so a rerun can actually change the resolution.
+    local cli_res=${AOE_RES:-}
     [ -r "$STATE" ] && . "$STATE"
+    [ -n "$cli_res" ] && AOE_RES=$cli_res
     [ -n "${AOE_RES:-}" ] || AOE_RES=1280x720
     trap 'printf "\nCancelled. Completed stages are skipped on the next run.\n"; exit 130' INT
     printf '%s\n' "Age of Empires II  x  Voobly  ->  Hangover Wine + FEX (Termux)"
