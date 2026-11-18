@@ -425,7 +425,7 @@ game_launch() {
     launch hwine "$label" "$GAME_DIR" explorer ${da:+"$da"} 'C:\windows\system32\cmd.exe' /d /c "$cmdline"
 }
 cmd=${1:-help}; [ $# -gt 0 ] && shift
-case "$cmd" in voobly|aoe2|aoc|aok|mount-game) aoe_game_ensure || exit 1 ;; esac
+case "$cmd" in voobly|voobly-interp|aoe2|aoc|aok|mount-game) aoe_game_ensure || exit 1 ;; esac
 case "$cmd" in
     voobly|voobly-interp)
         [ -f "${VOOBLY_EXE:-}" ] || { aoe_warn "Voobly not installed."; exit 1; }
