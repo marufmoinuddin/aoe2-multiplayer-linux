@@ -221,6 +221,12 @@ hf_env() {
     if [ ! -f "$(dirname "$HANGOVER_BIN")/lib/wine/aarch64-windows/$HODLL" ]; then
         aoe_warn "$HODLL is missing (pkg install $(emu_pkg "$AOE_EMU")); 32-bit programs will not start."
     fi
+    # Box64 is chatty by default: it repeats "[BOX64] GetSegmentBase does not apply to
+    # Wine dlls" for every Wine DLL it touches. That is noise, not an error, and writing
+    # thousands of lines is itself slow - the interpreter start-up is already the
+    # bottleneck. Set AOE_BOX64_LOG=1 (or 2/3) when debugging Box64 itself.
+    export BOX64_LOG="${AOE_BOX64_LOG:-0}"
+    export BOX64_NOBANNER=1
     export DISPLAY=:0 XDG_RUNTIME_DIR="${TMPDIR:-$PREFIX/tmp}"
     export LIBGL_ALWAYS_SOFTWARE=true GALLIUM_DRIVER=llvmpipe
     export WINEDLLOVERRIDES='*ddraw,*d3d9,*d3d10core,*d3d11,*dxgi=b'
@@ -242,6 +248,17 @@ hwineserver() { "$HANGOVER_BIN/wineserver" "$@"; }
 hwine_interp() {
     [ "${AOE_EMU:-fex}" = box64 ] || { hwine "$@"; return; }
     ( export BOX64_DYNAREC=0 BOX64_RCFILE=/dev/null; hwine "$@" )
+}
+
+# Runs the Voobly installer in one specific emulation mode. 'fex' relies on the caller
+# exporting HODLL=libwow64fex.dll, which makes it a per-run switch (both modules can be
+# installed at once).
+run_voobly_setup() {   # run_voobly_setup MODE wine-args...
+    local m=$1; shift
+    case "$m" in
+        interp) hwine_interp "$@" ;;
+        *)      hwine "$@" ;;
+    esac
 }
 
 # ---------------------------------------------------------- process control ---
@@ -456,7 +473,8 @@ write_launcher() {
 # Every start first frees TCP/UDP 47624 so DirectPlay can host/join games.
 AOE_BASE="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 . "$AOE_BASE/lib/env.sh" || exit 1
-hf_env || exit 1
+# 'logs' must work even when the runtime is broken - that is when it is needed.
+case "${1:-}" in logs) ;; *) hf_env || exit 1 ;; esac
 GAME_PATH="${GAME_PATH:-${GAME_DRIVE^^}:}"
 
 usage() {
@@ -470,6 +488,7 @@ Usage: aoe2-voobly <command> [game arguments]
   port-test    check $PORT, stop this prefix's Wine, check again
   stop         stop every Wine process of this prefix
   status       show drive link, port and running processes
+  logs [N]     show the tail (N lines, default 40) of the newest logs
   mount-game   (root mode) bind-mount the game folder now
   umount-game  (root mode) stop Wine and unmount the game folder
   wine ARGS    run Hangover's wine with this prefix (e.g. wine winecfg)
@@ -562,6 +581,16 @@ case "$cmd" in
             *)                   aoe_say "Still busy: the owner is not this prefix's Wine (or Android hides it)." ;;
         esac ;;
     stop)         aoe_stop_wine && aoe_say "Wine processes of this prefix stopped." ;;
+    logs)
+        n=${1:-40}
+        case "$n" in ''|*[!0-9]*) n=40 ;; esac
+        files=$(ls -t "$AOE_BASE"/logs/*.log 2>/dev/null | head -n 4)
+        [ -n "$files" ] || { aoe_say "No logs in $AOE_BASE/logs yet."; exit 0; }
+        printf '%s\n' "$files" | while IFS= read -r f; do
+            aoe_say "== $f"
+            tail -n "$n" "$f"
+            aoe_say ""
+        done ;;
     status)
         aoe_say "Prefix    : $WINEPREFIX"
         aoe_say "Wine      : $("$HANGOVER_BIN/wine" --version 2>/dev/null)"
@@ -648,6 +677,8 @@ stage_hangover() {
         say "  box64 - Box64 (smaller; Voobly gets the interpreter workaround)"
         ask "Emulator [fex/box64]" "fex"
         case "${REPLY,,}" in box64|b) AOE_EMU=box64 ;; *) AOE_EMU=fex ;; esac
+    else
+        say "Emulator from the last run: $AOE_EMU  (use --emu fex|box64 to change it)"
     fi
     case "$AOE_EMU" in box64|fex) ;; *) die "--emu must be fex or box64" ;; esac
     dll="$(emu_hodll "$AOE_EMU")"; pkg="$(emu_pkg "$AOE_EMU")"
@@ -1115,26 +1146,81 @@ stage_voobly() {
         staged="$stagedir/$(basename "$setup")"
         win="$(cd "$stagedir" && bounded 60 hwine winepath -w "$staged" 2>/dev/null | tr -d '\r' | grep -m1 -E '^[A-Za-z]:')"
 
-        local ilog="$LOGS/voobly-setup-$STAMP.log" rc=1 attempt
-        for attempt in 1 2; do
-            if [ "$AOE_EMU" = box64 ]; then
-                say "Running the Voobly installer with Box64's interpreter (attempt $attempt/2) ..."
-                say "  Its dynarec crashes this Delphi installer; the interpreter is slower but correct."
-            else
-                say "Running the Voobly installer (attempt $attempt/2) ..."
+        local ilog="$LOGS/voobly-setup-$STAMP.log" rc=1 pid waited mode
+        # Success is "voobly.exe exists", never the exit status: this installer has been
+        # seen exiting 0 without ever showing a window. Try the modes in order and stop at
+        # the first one that actually installs something. Under Box64 the interpreter comes
+        # first (its dynarec crashes Delphi code), then the dynarec, then FEX if present.
+        local -a modes=()
+        if [ "$AOE_EMU" = box64 ]; then
+            modes=(interp dynarec)
+            if [ -f "$(dirname "$HANGOVER_BIN")/lib/wine/aarch64-windows/libwow64fex.dll" ]; then
+                modes+=(fex)
             fi
+        else
+            modes=(dynarec)
+        fi
+        # A VooblySetup.exe left over from an earlier attempt keeps running inside the
+        # prefix. Inno Setup (which is what this installer is) allows only one live
+        # instance: the stale one holds the temp folder/mutex and the new one just sits
+        # there. Start every attempt from a clean prefix.
+        if [ -n "$(hf_wine_pids)" ]; then
+            say "Stopping leftover Wine processes of this prefix first ..."
+            aoe_stop_wine >>"$LOG" 2>&1 || true
+        fi
+        for mode in "${modes[@]}"; do
+            case "$mode" in
+                interp)  say "Voobly installer: Box64 interpreter (its dynarec crashes Delphi code) ..." ;;
+                dynarec) say "Voobly installer: Box64 dynarec ..." ;;
+                fex)     say "Voobly installer: FEX (32-bit module is installed, HODLL override for this run) ..." ;;
+            esac
+            say "  Installer log: $ilog"
+            say "  Watch it from another Termux session:  tail -f $ilog"
             : >"$ilog"
             if [ -n "$win" ]; then
                 local darg; darg=$(aoe_desktop_arg voobly-setup)
-                ( cd "$stagedir" && hwine_interp explorer ${darg:+"$darg"} "$win" ) >>"$ilog" 2>&1; rc=$?
+                ( cd "$stagedir"
+                  [ "$mode" = fex ] && export HODLL=libwow64fex.dll
+                  run_voobly_setup "$mode" explorer ${darg:+"$darg"} "$win" ) >>"$ilog" 2>&1 &
             else
-                ( cd "$stagedir" && hwine_interp "$staged" ) >>"$ilog" 2>&1; rc=$?
+                ( cd "$stagedir"
+                  [ "$mode" = fex ] && export HODLL=libwow64fex.dll
+                  run_voobly_setup "$mode" "$staged" ) >>"$ilog" 2>&1 &
             fi
-            bounded 60 hwineserver -w >>"$LOG" 2>&1
+            pid=$!
+            waited=0
+            # Bound each attempt: a mode that never opens a window must not hold the
+            # installer hostage for an hour. Override with AOE_SETUP_TIMEOUT (seconds).
+            local limit="${AOE_SETUP_TIMEOUT:-900}"
+            while kill -0 "$pid" 2>/dev/null; do
+                sleep 10
+                waited=$((waited + 10))
+                case "$waited" in
+                    30)  say "  still starting (30s). No window? Open the Termux:X11 app and keep it in front." ;;
+                    120) say "  still running (2 min); the emulator is slow, the log keeps growing." ;;
+                    300) say "  still running (5 min)." ;;
+                esac
+                if [ "$waited" -ge "$limit" ]; then
+                    warn "No result after $((limit / 60)) minutes; stopping this attempt and trying the next one."
+                    say  "  (Set AOE_SETUP_TIMEOUT=1800 to allow longer, or AOE_BOX64_LOG=1 for Box64 detail.)"
+                    kill -TERM "$pid" 2>/dev/null; sleep 2; kill -KILL "$pid" 2>/dev/null
+                    bounded 30 aoe_stop_wine >/dev/null 2>&1
+                    break
+                fi
+            done
+            wait "$pid" 2>/dev/null; rc=$?
+            # Kill whatever this attempt left behind (the installer spawns its own
+            # extracted copy), so the next mode starts from a clean prefix.
+            aoe_stop_wine >>"$LOG" 2>&1 || true
             found="$(find_ci "$WINEPREFIX/drive_c" voobly.exe 8)"
             [ -n "$found" ] && break
-            [ "$rc" -eq 0 ] && break
-            [ "$attempt" -lt 2 ] && { warn "Installer stopped early (status $rc); retrying once."; sleep 5; }
+            if [ "$(wc -c <"$ilog" 2>/dev/null || echo 0)" -lt 200 ] &&
+               ! grep -qi 'display\|x11drv\|err:' "$ilog"; then
+                warn "The installer produced almost no output and no Voobly ($mode, status $rc): no window opened."
+            else
+                warn "The installer did not finish ($mode, status $rc); trying the next mode."
+            fi
+            sleep 3
         done
         rm -rf "$stagedir"
         if [ -z "$found" ]; then
@@ -1142,6 +1228,12 @@ stage_voobly() {
             tail -n 30 "$ilog" | sed 's/^/  /'
             grep -Eqi 'x11drv|open display|connect.*display' "$ilog" &&
                 say "  Wine could not reach Termux:X11: open its app and keep it in front, then rerun."
+            say "  Full logs: $LOGS   (aoe2-voobly logs shows the newest ones)"
+            if [ "$AOE_EMU" = box64 ]; then
+                say "  If Box64 cannot bring this Delphi installer up, install FEX as well"
+                say "  (--emu fex) and rerun: the installer then also tries FEX, and the"
+                say "  prefix is shared, so you can switch back with '--emu box64' afterwards."
+            fi
             die "Voobly was not installed (installer status $rc). Post the lines above, or check $LOG."
         fi
     else
@@ -1276,11 +1368,13 @@ main() {
     [ -r "$STATE" ] && . "$STATE"
     [ -n "$cli_res" ] && AOE_RES=$cli_res
     [ -n "${AOE_RES:-}" ] || AOE_RES=none
-    # Same for --emu: the CLI value must survive the state load.
+    # Same for --emu: the CLI value must survive the state load. Do NOT default it
+    # here: stage 2 asks which emulator to use when nothing has chosen one yet, and
+    # a value set here would silently skip that question.
     [ -n "$EMU_ARG" ] && AOE_EMU=$EMU_ARG
-    [ -n "${AOE_EMU:-}" ] || AOE_EMU=fex
+    local emu_label=${AOE_EMU:-FEX-or-Box64}
     trap 'printf "\nCancelled. Completed stages are skipped on the next run.\n"; exit 130' INT
-    printf '%s\n' "Age of Empires II  x  Voobly  ->  Hangover Wine + $AOE_EMU (Termux)"
+    printf '%s\n' "Age of Empires II  x  Voobly  ->  Hangover Wine + $emu_label (Termux)"
     stage_preflight
     stage_hangover
     stage_prefix
