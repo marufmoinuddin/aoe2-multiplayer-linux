@@ -285,6 +285,26 @@ hf_wine_pids() {
     done
 }
 
+# PIDs of the Voobly installer itself (the original exe and the .tmp copy it
+# extracts). Inno Setup's original process exits as soon as it has started the
+# extracted copy, so "the launcher process ended" does NOT mean the installer is
+# done - and killing this copy closes the setup window in the user's face.
+setup_pids() {
+    local d pid cmd skip
+    skip=" $(hf_self_chain | tr '\n' ' ') "
+    for d in /proc/[0-9]*; do
+        pid=${d#/proc/}
+        case "$skip" in *" $pid "*) continue ;; esac
+        [ -O "$d" ] || continue
+        cmd=$(tr '\0' ' ' <"$d/cmdline" 2>/dev/null) || continue
+        case "$cmd" in
+            *VooblySetup*|*vooblysetup*) ;;
+            *) continue ;;
+        esac
+        echo "$pid"
+    done
+}
+
 # Normal prefix shutdown first, then TERM/KILL for whatever is left.
 aoe_stop_wine() {
     local pid
@@ -752,6 +772,8 @@ stage_prefix() {
     case "$AOE_EMU" in
         box64)
             if [[ "$out" == *Box64* ]]; then ok "The log confirms Box64 is emulating the 32-bit code."
+            elif [ "${BOX64_LOG:-0}" = 0 ]; then
+                ok "Box64 is the active backend (its banner is hidden by BOX64_LOG=0)."
             else warn "No Box64 line in the output, so Box64 use is not confirmed (32-bit code still ran)."; fi ;;
         *)
             if [[ "$out" == *FEX* ]]; then ok "The log confirms FEX is emulating the 32-bit code."
@@ -1161,12 +1183,16 @@ stage_voobly() {
             modes=(dynarec)
         fi
         # A VooblySetup.exe left over from an earlier attempt keeps running inside the
-        # prefix. Inno Setup (which is what this installer is) allows only one live
-        # instance: the stale one holds the temp folder/mutex and the new one just sits
-        # there. Start every attempt from a clean prefix.
-        if [ -n "$(hf_wine_pids)" ]; then
-            say "Stopping leftover Wine processes of this prefix first ..."
-            aoe_stop_wine >>"$LOG" 2>&1 || true
+        # prefix, and Inno Setup allows only one live instance, so it would hold the
+        # next attempt hostage. Close only those installer processes - not the whole
+        # prefix - because the extracted copy may be the window the user is using.
+        local stale
+        stale="$(setup_pids)"
+        if [ -n "$stale" ]; then
+            say "Closing leftover Voobly installer process(es): $(echo $stale)"
+            for pid in $stale; do kill -TERM "$pid" 2>/dev/null; done
+            sleep 2
+            for pid in $(setup_pids); do kill -KILL "$pid" 2>/dev/null; done
         fi
         for mode in "${modes[@]}"; do
             case "$mode" in
@@ -1192,7 +1218,11 @@ stage_voobly() {
             # Bound each attempt: a mode that never opens a window must not hold the
             # installer hostage for an hour. Override with AOE_SETUP_TIMEOUT (seconds).
             local limit="${AOE_SETUP_TIMEOUT:-900}"
-            while kill -0 "$pid" 2>/dev/null; do
+            # Wait for the installer, not for the launcher: Inno Setup's original
+            # process exits as soon as it has started the extracted .tmp copy, and that
+            # copy is what draws the window. Killing it here is what made the setup
+            # window vanish, so keep waiting while it is alive.
+            while kill -0 "$pid" 2>/dev/null || [ -n "$(setup_pids)" ]; do
                 sleep 10
                 waited=$((waited + 10))
                 case "$waited" in
@@ -1204,14 +1234,14 @@ stage_voobly() {
                     warn "No result after $((limit / 60)) minutes; stopping this attempt and trying the next one."
                     say  "  (Set AOE_SETUP_TIMEOUT=1800 to allow longer, or AOE_BOX64_LOG=1 for Box64 detail.)"
                     kill -TERM "$pid" 2>/dev/null; sleep 2; kill -KILL "$pid" 2>/dev/null
-                    bounded 30 aoe_stop_wine >/dev/null 2>&1
+                    for pid in $(setup_pids); do kill -KILL "$pid" 2>/dev/null; done
                     break
                 fi
             done
             wait "$pid" 2>/dev/null; rc=$?
-            # Kill whatever this attempt left behind (the installer spawns its own
-            # extracted copy), so the next mode starts from a clean prefix.
-            aoe_stop_wine >>"$LOG" 2>&1 || true
+            # Only now is the attempt really over; clear its remnants before the next
+            # mode so Inno Setup's single instance rule cannot block it.
+            for pid in $(setup_pids); do kill -KILL "$pid" 2>/dev/null; done
             found="$(find_ci "$WINEPREFIX/drive_c" voobly.exe 8)"
             [ -n "$found" ] && break
             if [ "$(wc -c <"$ilog" 2>/dev/null || echo 0)" -lt 200 ] &&
