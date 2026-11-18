@@ -15,11 +15,20 @@
 #
 #  Usage:
 #    bash aoe2-fex-voobly.sh [--game DIR] [--game-mode copy|root|keep]
-#                            [--voobly-setup FILE] [--prefix DIR] [--res WxH|none]
-#                            [--directplay] [--reset-prefix] [--reinstall-hangover] [--yes]
+#                            [--voobly-setup FILE] [--prefix DIR] [--res auto|WxH|none]
+#                            [--refresh-launchers-only] [--directplay]
+#                            [--reset-prefix] [--reinstall-hangover] [--yes]
+#
+#  --res auto   sizes a shared Wine virtual desktop ("aoe2-termux") from the live
+#               Termux:X11 screen at each launch; the pixel size is never cached.
+#  --res WxH    fixes that desktop to WIDTHxHEIGHT.  --res none leaves Wine's own
+#               desktop selection alone (restoring one this script changed earlier).
+#  --refresh-launchers-only  rewrite the runtime and the aoe2-voobly command and save
+#               the desktop mode, without running any installation stage.
 #
 #  Afterwards:  aoe2-voobly voobly | aoe2 | aok | clear-port | port-test |
-#                           stop | status | mount-game | umount-game | wine ARGS...
+#                           stop | status | desktop-size | mount-game | umount-game |
+#                           wine ARGS...
 #
 #  Wine is not a sandbox. Use only game files and installers you trust.
 # =============================================================================
@@ -49,7 +58,7 @@ DIRECTX_MIRRORS=(
     'https://web.archive.org/web/2016id_/https://download.microsoft.com/download/E/E/1/EE17FF74-6C45-4575-9CF4-7FC2597ACD18/directx_feb2010_redist.exe'
 )
 
-GAME_DIR_ARG=""; GAME_MODE_ARG=""; SETUP_ARG=""; PREFIX_ARG=""; ASSUME_YES=0
+GAME_DIR_ARG=""; GAME_MODE_ARG=""; SETUP_ARG=""; PREFIX_ARG=""; ASSUME_YES=0; REFRESH_ONLY=0
 WANT_DIRECTPLAY=0; REINSTALL_HANGOVER=0; RESET_PREFIX=0
 C_ON=""; { [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; } && C_ON=1
 
@@ -171,11 +180,103 @@ bounded() {
 # AOE_RES=none (default) opens a normal, freely resizable Wine window, so the
 # game can run at whatever size Termux:X11 gives it. AOE_RES=WxH opts into a
 # Wine virtual desktop pinned to exactly that size.
-aoe_desktop_arg() {   # aoe_desktop_arg NAME -> one explorer arg, or nothing
-    case "${AOE_RES:-none}" in
+# AOE_RES=auto creates a shared virtual desktop sized from the live X11 screen.
+# The size is measured at each launch and never cached in state.env, so rotating or
+# resizing Termux:X11 is picked up by the next start.
+aoe_valid_res() {
+    [[ "$1" =~ ^([0-9]+)x([0-9]+)$ ]] || return 1
+    local w=$((10#${BASH_REMATCH[1]})) h=$((10#${BASH_REMATCH[2]}))
+    (( w > 0 && h > 0 && w <= 32767 && h <= 32767 ))
+}
+
+aoe_x11_resolution() {
+    local out res
+    if command -v xrandr >/dev/null 2>&1; then
+        out=$(LC_ALL=C bounded 8 xrandr --current 2>/dev/null) || out=""
+        res=$(printf '%s\n' "$out" | sed -n 's/.*current \([0-9][0-9]*\) x \([0-9][0-9]*\),.*/\1x\2/p' | head -n1)
+        if aoe_valid_res "$res"; then printf '%s\n' "$res"; return 0; fi
+    fi
+    if command -v xdpyinfo >/dev/null 2>&1; then
+        out=$(LC_ALL=C bounded 8 xdpyinfo 2>/dev/null) || out=""
+        res=$(printf '%s\n' "$out" | awk '/dimensions:/ {print $2; exit}')
+        if aoe_valid_res "$res"; then printf '%s\n' "$res"; return 0; fi
+    fi
+    return 1
+}
+
+aoe_resolve_res() {
+    local mode=${AOE_RES:-none} res previous="" i
+    case "$mode" in
         none|off|windowed|"") return 0 ;;
-        *) printf '/desktop=%s,%s' "$1" "$AOE_RES" ;;
+        auto)
+            for i in 1 2 3 4 5 6 7 8; do
+                res=$(aoe_x11_resolution) || res=""
+                if [ -n "$res" ] && [ "$res" = "$previous" ]; then
+                    printf '%s\n' "$res"; return 0
+                fi
+                previous=$res
+                sleep 0.3
+            done
+            aoe_warn 'Could not obtain a stable X11 resolution. Open Termux:X11, install xorg-xrandr, or use --res WIDTHxHEIGHT.'
+            return 1 ;;
+        *)
+            aoe_valid_res "$mode" || { aoe_warn "Invalid desktop resolution: $mode"; return 1; }
+            printf '%s\n' "$mode" ;;
     esac
+}
+
+# Registry helpers for the shared virtual desktop. Keeping it in the registry (instead
+# of an explorer /desktop argument) avoids explorer rewriting cmd.exe's /d /c switches.
+aoe_reg_sz() {
+    local out
+    out=$(bounded 45 hwine reg query "$1" /v "$2" 2>/dev/null) || return 1
+    printf '%s\n' "$out" | grep -q 'REG_SZ' || return 1
+    printf '%s\n' "$out" | tr -d '\r' |
+        sed -n 's/^[[:space:]]*[^[:space:]]*[[:space:]][[:space:]]*REG_SZ[[:space:]]*//p' | head -n1
+}
+
+aoe_reg_restore() {
+    if [ "$3" = 1 ]; then
+        bounded 45 hwine reg add "$1" /v "$2" /t REG_SZ /d "$4" /f >/dev/null 2>&1
+    elif aoe_reg_sz "$1" "$2" >/dev/null; then
+        bounded 45 hwine reg delete "$1" /v "$2" /f >/dev/null 2>&1
+    fi
+}
+
+# Point the prefix's Explorer at a named virtual desktop sized from AOE_RES. The previous
+# selection is saved per prefix so "none" can put it back, and a manual winecfg change is
+# reported instead of being overwritten.
+aoe_desktop_configure() {
+    local res key='HKCU\Software\Wine\Explorer' name=aoe2-termux
+    local backup current
+    backup="$AOE_BASE/desktop-before-$(printf '%s' "$WINEPREFIX" | sha256sum | cut -c1-16).env"
+    local VD_OLD_DESKTOP="" VD_OLD_SIZE="" VD_HAS_DESKTOP=0 VD_HAS_SIZE=0
+    res=$(aoe_resolve_res) || return 1
+    if [ -z "$res" ]; then
+        [ -r "$backup" ] || return 0
+        . "$backup"
+        current=$(aoe_reg_sz "$key" Desktop) || current=""
+        if [ "$current" != "$name" ]; then
+            aoe_warn 'Desktop selection was changed outside this launcher; saved settings were not restored.'
+            return 0
+        fi
+        aoe_reg_restore "$key" Desktop "$VD_HAS_DESKTOP" "$VD_OLD_DESKTOP" || return 1
+        aoe_reg_restore "$key\Desktops" "$name" "$VD_HAS_SIZE" "$VD_OLD_SIZE" || return 1
+        rm -f -- "$backup"
+        aoe_say 'Restored the previous Wine desktop settings.'
+        return 0
+    fi
+    if [ ! -f "$backup" ]; then
+        if VD_OLD_DESKTOP=$(aoe_reg_sz "$key" Desktop); then VD_HAS_DESKTOP=1; fi
+        if VD_OLD_SIZE=$(aoe_reg_sz "$key\Desktops" "$name"); then VD_HAS_SIZE=1; fi
+        ( umask 077
+          printf 'VD_HAS_DESKTOP=%q\nVD_HAS_SIZE=%q\nVD_OLD_DESKTOP=%q\nVD_OLD_SIZE=%q\n' \
+            "$VD_HAS_DESKTOP" "$VD_HAS_SIZE" "$VD_OLD_DESKTOP" "$VD_OLD_SIZE" >"$backup.tmp"
+        ) && mv -- "$backup.tmp" "$backup" || return 1
+    fi
+    bounded 45 hwine reg add "$key\Desktops" /v "$name" /t REG_SZ /d "$res" /f >/dev/null 2>&1 || return 1
+    bounded 45 hwine reg add "$key" /v Desktop /t REG_SZ /d "$name" /f >/dev/null 2>&1 || return 1
+    aoe_say "Wine virtual desktop: $name at $res (mode: ${AOE_RES:-none}, DISPLAY=$DISPLAY)"
 }
 
 hf_env() {
@@ -428,6 +529,7 @@ Usage: aoe2-voobly <command> [game arguments]
   clear-port   free TCP/UDP $PORT now
   port-test    check $PORT, stop this prefix's Wine, check again
   stop         stop every Wine process of this prefix
+  desktop-size show the resolved X11/desktop size without starting Wine apps
   status       show drive link, port and running processes
   mount-game   (root mode) bind-mount the game folder now
   umount-game  (root mode) stop Wine and unmount the game folder
@@ -449,7 +551,16 @@ launch() {   # launch LABEL WORKDIR wine-args...
     fi
     command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock
     aoe_port_clear || aoe_warn "Continuing with port $PORT busy; multiplayer may fail."
-    aoe_display || aoe_warn "No X11 display answered; open the Termux:X11 app and keep it in front."
+    if ! aoe_display; then
+        aoe_warn "No X11 display answered; open Termux:X11 before launching."
+        command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock
+        exit 1
+    fi
+    if ! aoe_desktop_configure; then
+        aoe_warn "Virtual desktop setup failed; the game was not started."
+        command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock
+        exit 1
+    fi
     aoe_audio
     mkdir -p "$AOE_BASE/logs"
     logf="$AOE_BASE/logs/$label-$(date +%Y%m%d-%H%M%S).log"
@@ -469,13 +580,14 @@ launch() {   # launch LABEL WORKDIR wine-args...
 # The game launcher lives in a subfolder but loads DLLs from the game root, so it is
 # started from <drive>:\ (Windows working directory) via cmd's `start /wait`.
 game_launch() {   # game_launch LABEL REL_EXE [args...]
-    local label=$1 rel=$2 relw win cmdline da; shift 2
+    local label=$1 rel=$2 relw win cmdline; shift 2
     [ -f "$GAME_DIR/$rel" ] || { aoe_warn "Missing executable: $GAME_DIR/$rel  (rerun the installer)"; exit 1; }
     relw=${rel//\//\\}
     win="$GAME_PATH\\$relw"
     cmdline="cd /d $GAME_PATH\\ && start \"\" /wait $win${*:+ $*}"
-    da=$(aoe_desktop_arg aoe2fex)
-    launch "$label" "$GAME_DIR" explorer ${da:+"$da"} 'C:\windows\system32\cmd.exe' /d /c "$cmdline"
+    # No explorer here: it rewrites the /d /c switches. The virtual desktop comes from
+    # the registry settings applied in launch().
+    launch "$label" "$GAME_DIR" 'C:\windows\system32\cmd.exe' /d /c "$cmdline"
 }
 
 cmd=${1:-help}; [ $# -gt 0 ] && shift
@@ -488,8 +600,11 @@ esac
 case "$cmd" in
     voobly)
         [ -f "${VOOBLY_EXE:-}" ] || { aoe_warn "Voobly is not installed (rerun the installer)."; exit 1; }
-        da=$(aoe_desktop_arg voobly)
-        launch voobly "$(dirname "$VOOBLY_EXE")" explorer ${da:+"$da"} "$(win_of "$VOOBLY_EXE")" "$@" ;;
+        launch voobly "$(dirname "$VOOBLY_EXE")" "$(win_of "$VOOBLY_EXE")" "$@" ;;
+    desktop-size)
+        aoe_display || exit 1
+        resolved=$(aoe_resolve_res) || exit 1
+        aoe_say "Mode: ${AOE_RES:-none}; desktop: ${resolved:-disabled}; DISPLAY=$DISPLAY" ;;
     aoe2|aoc)     game_launch aoe2 "$AOC_REL" "$@" ;;
     aok)          game_launch aok "$AOK_REL" "$@" ;;
     mount-game)
@@ -515,6 +630,7 @@ case "$cmd" in
     stop)         aoe_stop_wine && aoe_say "Wine processes of this prefix stopped." ;;
     status)
         aoe_say "Prefix    : $WINEPREFIX"
+        aoe_say "Desktop   : ${AOE_RES:-none} (auto is measured at each launch)"
         aoe_say "Wine      : $("$HANGOVER_BIN/wine" --version 2>/dev/null)"
         aoe_say "Game      : ${GAME_DIR:-?}  ->  ${GAME_PATH:-?}"
         case "${GAME_MODE:-keep}" in
@@ -554,7 +670,7 @@ stage_preflight() {
     fi
 
     local need=() c
-    for c in curl:curl cabextract:cabextract pgrep:procps lsof:lsof flock:util-linux; do
+    for c in curl:curl cabextract:cabextract pgrep:procps lsof:lsof flock:util-linux xrandr:xorg-xrandr; do
         command -v "${c%%:*}" >/dev/null 2>&1 || need+=("${c##*:}")
     done
     if [ ${#need[@]} -gt 0 ]; then
@@ -1031,25 +1147,22 @@ stage_voobly() {
             say  "Open the Termux:X11 app and leave its window in front, then answer y."
             yes_no "Start the Voobly installer anyway?" y || die "Cancelled; rerun once Termux:X11 shows a window."
         fi
+        # Configure the shared virtual desktop in the registry instead of passing it
+        # through explorer, which rewrites the installer's own switches.
+        aoe_desktop_configure || warn "Could not configure the Wine desktop; continuing without it."
 
         # Stage the installer in a private folder; the prefix and installer then never
         # depend on Android shared-storage behaviour.
-        local stagedir="$CACHE/voobly-setup" staged win
+        local stagedir="$CACHE/voobly-setup" staged
         rm -rf "$stagedir"; mkdir -p "$stagedir"
         cp -f "$setup" "$stagedir/" || die "Could not stage the installer in $stagedir."
         staged="$stagedir/$(basename "$setup")"
-        win="$(cd "$stagedir" && bounded 60 hwine winepath -w "$staged" 2>/dev/null | tr -d '\r' | grep -m1 -E '^[A-Za-z]:')"
 
         local ilog="$LOGS/voobly-setup-$STAMP.log" rc=1 attempt
         for attempt in 1 2; do
             say "Running the Voobly installer (attempt $attempt/2) ..."
             : >"$ilog"
-            if [ -n "$win" ]; then
-                local darg; darg=$(aoe_desktop_arg voobly-setup)
-                ( cd "$stagedir" && hwine explorer ${darg:+"$darg"} "$win" ) >>"$ilog" 2>&1; rc=$?
-            else
-                ( cd "$stagedir" && hwine "$staged" ) >>"$ilog" 2>&1; rc=$?
-            fi
+            ( cd "$stagedir" && hwine "$staged" ) >>"$ilog" 2>&1; rc=$?
             bounded 60 hwineserver -w >>"$LOG" 2>&1
             found="$(find_ci "$WINEPREFIX/drive_c" voobly.exe 8)"
             [ -n "$found" ] && break
@@ -1074,10 +1187,20 @@ stage_voobly() {
 
 stage_launchers() {
     stage 7 "Create launchers"
+    refresh_launchers
+    save_state
+}
+
+# Write (or replace) the runtime and the launcher command. Called at startup as well as
+# in stage 7, so an old launcher left by an earlier version is always overwritten - even
+# if a later stage fails and the run stops before stage 7.
+refresh_launchers() {
+    local existed=0
+    [ -e "$BIN/aoe2-voobly" ] && existed=1
     write_env_lib
     write_launcher
-    save_state
-    ok "Command installed: aoe2-voobly  ($PREFIX/bin/aoe2-voobly)"
+    if [ "$existed" = 1 ]; then ok "Launcher replaced: $PREFIX/bin/aoe2-voobly"
+    else ok "Launcher installed: $PREFIX/bin/aoe2-voobly"; fi
 }
 
 stage_final() {
@@ -1113,8 +1236,17 @@ Commands
   aoe2-voobly clear-port  free TCP/UDP $PORT
   aoe2-voobly port-test   port state before/after stopping this prefix's Wine
   aoe2-voobly stop        stop all Wine processes of this prefix
+  aoe2-voobly desktop-size  show the desktop Wine would use, without starting it
   aoe2-voobly mount-game / umount-game   (root mode) mount or unmount the game folder
   aoe2-voobly status
+
+Desktop
+  Current mode: ${AOE_RES:-none}
+    auto       measured from Termux:X11 at every launch (needs xorg-xrandr)
+    WIDTHxHEIGHT  fixed size for the shared "aoe2-termux" virtual desktop
+    none       leave Wine's own desktop selection alone
+  Change it without reinstalling anything:
+    bash $0 --refresh-launchers-only --res auto|WIDTHxHEIGHT|none
 
 In Voobly (Game Diagnostics / settings)
   Installation directory : $inst_dir
@@ -1151,8 +1283,9 @@ show_help() {
     else
         printf '%s\n' \
             "Usage: bash install.sh [--game DIR] [--game-mode copy|root|keep]" \
-            "                       [--voobly-setup FILE] [--prefix DIR] [--res WxH|none]" \
-            "                       [--directplay] [--reset-prefix] [--reinstall-hangover] [--yes]" \
+            "                       [--voobly-setup FILE] [--prefix DIR] [--res auto|WxH|none]" \
+            "                       [--refresh-launchers-only] [--directplay]" \
+            "                       [--reset-prefix] [--reinstall-hangover] [--yes]" \
             "Run the downloaded file directly for the full description."
     fi
 }
@@ -1165,12 +1298,14 @@ parse_args() {
                                   case "$GAME_MODE_ARG" in copy|root|keep) ;; *) die "--game-mode must be copy, root or keep" ;; esac ;;
             --voobly-setup)       [ $# -ge 2 ] || die "--voobly-setup needs a file"; SETUP_ARG=$2; shift 2 ;;
             --prefix)             [ $# -ge 2 ] || die "--prefix needs a directory"; PREFIX_ARG=$2; shift 2 ;;
-            --res)                [ $# -ge 2 ] || die "--res needs WIDTHxHEIGHT or none"; AOE_RES=$2; shift 2
+            --res)                [ $# -ge 2 ] || die "--res needs auto, WIDTHxHEIGHT or none"; AOE_RES=$2; shift 2
                                   case "$AOE_RES" in
                                       none|off|windowed) AOE_RES=none ;;
+                                      auto) ;;
                                       *) [[ "$AOE_RES" =~ ^[0-9]+x[0-9]+$ ]] ||
-                                             die "--res must be WIDTHxHEIGHT (e.g. 1280x720) or none" ;;
+                                             die "--res must be auto, WIDTHxHEIGHT (e.g. 1280x720) or none" ;;
                                   esac ;;
+            --refresh-launchers-only) REFRESH_ONLY=1; shift ;;
             --directplay)         WANT_DIRECTPLAY=1; shift ;;
             --reset-prefix)       RESET_PREFIX=1; shift ;;
             --reinstall-hangover) REINSTALL_HANGOVER=1; shift ;;
@@ -1190,8 +1325,21 @@ main() {
     [ -r "$STATE" ] && . "$STATE"
     [ -n "$cli_res" ] && AOE_RES=$cli_res
     [ -n "${AOE_RES:-}" ] || AOE_RES=none
+    if [ "$REFRESH_ONLY" = 1 ]; then
+        # Update the runtime + launcher only: no packages, no prefix, no game copy,
+        # no DirectPlay, no Voobly install, no final smoke test.
+        [ -r "$STATE" ] || die "No existing installation at $STATE. Run the installer normally once."
+        refresh_launchers
+        save_state
+        say "Saved desktop mode AOE_RES=$AOE_RES (measured at each launch when 'auto')."
+        ok "Launchers and runtime updated; no installation stages were run."
+        exit 0
+    fi
     trap 'printf "\nCancelled. Completed stages are skipped on the next run.\n"; exit 130' INT
     printf '%s\n' "Age of Empires II  x  Voobly  ->  Hangover Wine + FEX (Termux)"
+    # Replace any launcher from an earlier version up front: a failure in a later stage
+    # must not leave a stale command behind.
+    refresh_launchers
     stage_preflight
     stage_hangover
     stage_prefix
