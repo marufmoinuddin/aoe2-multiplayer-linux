@@ -3,15 +3,17 @@
 #  Age of Empires II + Voobly — Termux uninstaller
 #
 #  Removes everything the installer created:
-#    - the Wine prefix (default: ~/.local/share/aoe2-fex/prefix)
-#    - installer data (lib/, bin/, tools/, cache/, logs/, state.env, backups/)
+#    - the Wine prefix (default: ~/.local/share/aoe2-fex/prefix), including the
+#      "aoe2-termux" virtual desktop and the Direct3D=gdi renderer set in its registry
+#    - installer data (lib/, bin/, tools/, cache/, logs/, state.env, backups/,
+#      launch.lock, desktop-before-*.env)
 #    - the `aoe2-voobly` command installed in $PREFIX/bin
 #    - the root bind mount (--game-mode root), if it is still mounted
 #
 #  NEVER removed:
 #    - your AoE II game folder, including the ~/aoe2 copy made by --game-mode copy
 #    - the Voobly setup .exe you downloaded
-#    - Termux packages (hangover-wine, termux-x11-nightly, pulseaudio, ...)
+#    - Termux packages (hangover-wine, termux-x11-nightly, pulseaudio, xorg-xrandr, ...)
 #
 #  Usage:
 #    bash uninstall_aoe2_voobly_termux.sh                 # interactive
@@ -277,7 +279,7 @@ main() {
             say "  - original game folder: $GAME_ORIG"
     fi
     say "  - the Voobly setup .exe you downloaded"
-    say "  - Termux packages (hangover-wine, termux-x11-nightly, pulseaudio, ...)"
+    say "  - Termux packages (hangover-wine, termux-x11-nightly, pulseaudio, xorg-xrandr, ...)"
 
     if [ "$any" = 0 ] && [ ${#BACKUPS[@]} -eq 0 ]; then
         say ""

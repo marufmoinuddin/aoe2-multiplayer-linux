@@ -8,7 +8,9 @@
 #  3. Maps your AoE II folder as a Wine drive (symlink in dosdevices). If the folder
 #     is outside Termux's private storage (e.g. /sdcard, mounted noexec by Android)
 #     you choose: a ROOT bind mount of the raw storage path, or a COPY into ~/aoe2.
-#  4. (optional, --directplay) installs native DirectPlay via winetricks.
+#  4. Installs native DirectPlay via winetricks, which Voobly lobbies need. It is the
+#     default; pass --no-directplay to keep Wine's built-in DirectPlay instead (the
+#     choice is remembered in state.env).
 #  5. Installs Voobly (installer is staged in a private folder first).
 #  6. Creates the `aoe2-voobly` command. Every launch first frees TCP/UDP 47624
 #     (and, in root mode, re-creates the bind mount if a reboot removed it).
@@ -16,7 +18,7 @@
 #  Usage:
 #    bash aoe2-fex-voobly.sh [--game DIR] [--game-mode copy|root|keep]
 #                            [--voobly-setup FILE] [--prefix DIR] [--res auto|WxH|none]
-#                            [--refresh-launchers-only] [--directplay]
+#                            [--refresh-launchers-only] [--no-directplay]
 #                            [--reset-prefix] [--reinstall-hangover] [--yes]
 #
 #  --res auto   sizes a shared Wine virtual desktop ("aoe2-termux") from the live
@@ -59,7 +61,7 @@ DIRECTX_MIRRORS=(
 )
 
 GAME_DIR_ARG=""; GAME_MODE_ARG=""; SETUP_ARG=""; PREFIX_ARG=""; ASSUME_YES=0; REFRESH_ONLY=0
-WANT_DIRECTPLAY=0; REINSTALL_HANGOVER=0; RESET_PREFIX=0
+WANT_DIRECTPLAY=1; NO_DIRECTPLAY=0; DP_CLI=0; REINSTALL_HANGOVER=0; RESET_PREFIX=0
 C_ON=""; { [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; } && C_ON=1
 
 # ------------------------------------------------------------------ UI helpers
@@ -129,6 +131,7 @@ save_state() {
         printf 'HANGOVER_BIN=%q\n' "${HANGOVER_BIN:-}"
         printf 'AOE_PREFIX=%q\n'   "${AOE_PREFIX:-}"
         printf 'AOE_RES=%q\n'      "${AOE_RES:-none}"
+        printf 'AOE_NO_DIRECTPLAY=%q\n' "${NO_DIRECTPLAY:-0}"
         printf 'GAME_DIR=%q\n'     "${GAME_DIR:-}"
         printf 'GAME_MODE=%q\n'    "${GAME_MODE:-keep}"
         printf 'GAME_ORIG=%q\n'    "${GAME_ORIG:-}"
@@ -153,6 +156,10 @@ write_env_lib() {
 # installer to regenerate it.
 : "${PREFIX:=/data/data/com.termux/files/usr}"
 PORT=47624
+# AoE II itself uses UDP 2300-2400 for game traffic, and Voobly's lobby needs 47624
+# TCP+UDP. DirectPlay reports that it cannot open the port when either range is taken.
+GAME_PORTS_FIRST=2300
+GAME_PORTS_LAST=2400
 AOE_STATE="${AOE_BASE:?AOE_BASE must be set}/state.env"
 
 aoe_say()  { printf '%s\n' "$*"; }
@@ -279,6 +286,24 @@ aoe_desktop_configure() {
     aoe_say "Wine virtual desktop: $name at $res (mode: ${AOE_RES:-none}, DISPLAY=$DISPLAY)"
 }
 
+# Classic AoE II draws through DirectDraw. With Wine's default renderer the game window
+# stays black on Termux + FEX; pinning the Direct3D renderer to GDI fixes it. The obsolete
+# DirectDrawRenderer value is removed for the same reason. Idempotent: a wine call is made
+# only when the value is not already "gdi".
+aoe_d3d_gdi() {
+    local key='HKCU\Software\Wine\Direct3D' cur
+    cur=$(bounded 45 hwine reg query "$key" /v renderer 2>/dev/null | tr -d '\r' |
+          sed -n 's/.*REG_SZ[[:space:]]*//p' | head -n1)
+    [ "$cur" = gdi ] && return 0
+    bounded 45 hwine reg delete "$key" /v DirectDrawRenderer /f >/dev/null 2>&1
+    if bounded 45 hwine reg add "$key" /v renderer /t REG_SZ /d gdi /f >/dev/null 2>&1; then
+        aoe_say "Wine Direct3D renderer set to gdi (this is what keeps the game from staying black)."
+        return 0
+    fi
+    aoe_warn "Could not set the Direct3D renderer to gdi; the game may show a black window."
+    return 1
+}
+
 hf_env() {
     local want_res=${AOE_RES:-}
     [ -r "$AOE_STATE" ] && . "$AOE_STATE"
@@ -380,6 +405,64 @@ for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
     return 1
 }
 
+# UDP ports in the AoE II range that cannot be bound right now (one per line).
+# Needs python3: lsof/ss/fuser see little or nothing on Android 10+.
+game_ports_busy() {
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 - "$GAME_PORTS_FIRST" "$GAME_PORTS_LAST" <<'PY' 2>/dev/null
+import socket, sys
+first, last = int(sys.argv[1]), int(sys.argv[2])
+for p in range(first, last + 1):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.bind(("0.0.0.0", p))
+    except OSError:
+        print(p)
+    finally:
+        s.close()
+PY
+}
+
+# Everything needed to judge a multiplayer port problem, in one place.
+aoe_port_report() {
+    aoe_say "DirectPlay port $PORT"
+    aoe_say "  owners (lsof/ss/fuser): $(port_pids | tr '\n' ' ')"
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$PORT" <<'PY' 2>/dev/null
+import socket, sys
+p = int(sys.argv[1])
+for name, kind in (("TCP", socket.SOCK_STREAM), ("UDP", socket.SOCK_DGRAM)):
+    s = socket.socket(socket.AF_INET, kind)
+    if kind == socket.SOCK_STREAM:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("0.0.0.0", p))
+        print("  %s: free (bindable)" % name)
+    except OSError as e:
+        print("  %s: BUSY (%s)" % (name, e.strerror))
+    finally:
+        s.close()
+PY
+    else
+        aoe_say "  python3 missing: exact TCP/UDP bind test unavailable"
+        port_busy && aoe_say "  connect probe: BUSY" || aoe_say "  connect probe: free (does not cover UDP)"
+    fi
+    local g; g="$(game_ports_busy | tr '\n' ' ')"
+    aoe_say "Game UDP range $GAME_PORTS_FIRST-$GAME_PORTS_LAST"
+    aoe_say "  in use: ${g:-none}"
+    local ov
+    # Read the override from the prefix file: `wine reg query` would start a wineserver
+    # and leave Wine processes behind, which is exactly what a diagnostic must not do.
+    local dp="Wine built-in (native DirectPlay is the installer default: bash install.sh)"
+    if [ -r "$WINEPREFIX/user.reg" ] &&
+       sed -n '/^\[Software\\\\Wine\\\\DllOverrides\]/,/^\[/p' "$WINEPREFIX/user.reg" |
+           grep -q '"dplayx"="[^"]*native'; then
+        dp="native dplayx override present"
+    fi
+    aoe_say "DirectPlay: $dp"
+    aoe_say "Wine pids of this prefix: $(hf_wine_pids | tr '\n' ' ')"
+}
+
 aoe_port_clear() {
     local pid i
     if ! port_busy; then aoe_say "Port $PORT is free."; return 0; fi
@@ -401,9 +484,17 @@ aoe_port_clear() {
     for i in 1 2 3 4 5 6; do port_busy || break; sleep 0.5; done
     if port_busy; then
         aoe_warn "Port $PORT is still busy (another app or a process of another user?)."
+        aoe_say  "  Run 'aoe2-voobly port-diag' for the details."
         return 1
     fi
     aoe_say "Port $PORT is free."
+    # The game binds UDP 2300-2400 itself. Do not kill unrelated apps here; just report,
+    # because a match fails to connect when one of those ports is already taken.
+    local g; g="$(game_ports_busy | tr '\n' ' ')"
+    if [ -n "$g" ]; then
+        aoe_warn "Game UDP port(s) already in use: $g"
+        aoe_say  "  If the lobby or the match cannot connect, see 'aoe2-voobly port-diag'."
+    fi
 }
 
 # ----------------------------------------------------------- display / audio ---
@@ -528,7 +619,9 @@ Usage: aoe2-voobly <command> [game arguments]
   aok          start the Age of Kings executable directly
   clear-port   free TCP/UDP $PORT now
   port-test    check $PORT, stop this prefix's Wine, check again
+  port-diag    report who holds $PORT (TCP/UDP) and the game's UDP range
   stop         stop every Wine process of this prefix
+  d3d-gdi      set Wine's Direct3D renderer to gdi (fixes a black game window)
   desktop-size show the resolved X11/desktop size without starting Wine apps
   status       show drive link, port and running processes
   mount-game   (root mode) bind-mount the game folder now
@@ -561,6 +654,7 @@ launch() {   # launch LABEL WORKDIR wine-args...
         command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock
         exit 1
     fi
+    aoe_d3d_gdi || aoe_warn "Continuing with Wine's current Direct3D renderer; the game may stay black."
     aoe_audio
     mkdir -p "$AOE_BASE/logs"
     logf="$AOE_BASE/logs/$label-$(date +%Y%m%d-%H%M%S).log"
@@ -605,6 +699,8 @@ case "$cmd" in
         aoe_display || exit 1
         resolved=$(aoe_resolve_res) || exit 1
         aoe_say "Mode: ${AOE_RES:-none}; desktop: ${resolved:-disabled}; DISPLAY=$DISPLAY" ;;
+    d3d-gdi)
+        aoe_d3d_gdi && aoe_say "Direct3D renderer: gdi (DirectDrawRenderer removed)." ;;
     aoe2|aoc)     game_launch aoe2 "$AOC_REL" "$@" ;;
     aok)          game_launch aok "$AOK_REL" "$@" ;;
     mount-game)
@@ -616,6 +712,7 @@ case "$cmd" in
             aoe_bind_umount "$GAME_DIR" && aoe_say "Unmounted $GAME_DIR."
         else aoe_say "Game mode is '${GAME_MODE:-keep}': nothing to unmount."; fi ;;
     clear-port)   aoe_port_clear ;;
+    port-diag)    aoe_port_report ;;
     port-test)
         port_busy && b=busy || b=available
         aoe_say "Before shutdown: $b"
@@ -670,7 +767,7 @@ stage_preflight() {
     fi
 
     local need=() c
-    for c in curl:curl cabextract:cabextract pgrep:procps lsof:lsof flock:util-linux xrandr:xorg-xrandr; do
+    for c in curl:curl cabextract:cabextract pgrep:procps lsof:lsof flock:util-linux xrandr:xorg-xrandr python3:python; do
         command -v "${c%%:*}" >/dev/null 2>&1 || need+=("${c##*:}")
     done
     if [ ${#need[@]} -gt 0 ]; then
@@ -691,7 +788,7 @@ stage_preflight() {
     curl --version >/dev/null 2>&1 ||
         die "curl still cannot run. Run 'pkg update && pkg upgrade -y', restart Termux, then rerun this installer."
     command -v python3 >/dev/null 2>&1 ||
-        warn "python3 not installed: port checks and the executable-storage test are less exact (pkg install python)."
+        warn "python3 is still missing: port checks and the executable-storage test are less exact."
     ok "Termux, ARM64 and storage access look fine."
 }
 
@@ -759,6 +856,7 @@ stage_prefix() {
     fi
     [ -f "$WINEPREFIX/system.reg" ] || die "Wine did not create a prefix. See the log."
     ok "Prefix: $WINEPREFIX"
+    aoe_d3d_gdi || warn "The game may show a black window; rerun with 'aoe2-voobly d3d-gdi' later."
 
     out="$(bounded 300 hwine 'C:\windows\syswow64\cmd.exe' /d /c 'echo WIN32_APP_OK' 2>&1)"
     printf '%s\n' "$out" >>"$LOG"
@@ -1038,9 +1136,10 @@ stage_game() {
     fi
 }
 
-# ------------------------------------------------- DirectPlay (opt-in stage) ---
-# Not part of the verified setup: Wine's built-in DirectPlay is used by default.
-# Enable with --directplay only if a lobby reports a specific DirectPlay failure.
+# ---------------------------------------------------------- DirectPlay stage ---
+# Native DirectPlay is installed by default: Voobly lobbies need it, and Wine's built-in
+# implementation is what produces the classic "cannot open port" / DirectPlay failures.
+# --no-directplay keeps the built-in one (remembered in state.env).
 directplay_ready() {
     local sys="$WINEPREFIX/drive_c/windows/syswow64" f out
     for f in "${DIRECTPLAY_FILES[@]}"; do [ "$(pe_machine "$sys/$f")" = i386 ] || return 1; done
@@ -1086,15 +1185,16 @@ seed_redist() {
 }
 
 stage_directplay() {
-    stage 5 "Native DirectPlay (optional)"
-    if [ "$WANT_DIRECTPLAY" != 1 ]; then
-        say "Skipped: Wine's built-in DirectPlay is used (the verified setup)."
-        say "If a Voobly lobby reports a DirectPlay error, rerun with --directplay."
+    stage 5 "Native DirectPlay"
+    if [ "$NO_DIRECTPLAY" = 1 ]; then
+        say "Skipped: --no-directplay was given, so Wine's built-in DirectPlay is used."
+        say "Voobly lobbies normally need native DirectPlay; multiplayer will probably fail."
         return 0
     fi
     if directplay_ready; then ok "Native DirectPlay is already installed."; return 0; fi
     warn "Native DirectPlay under FEX is untested. Back up the prefix if you want a way back."
-    yes_no "Close this prefix's Wine apps and install native DirectPlay now?" y || die "DirectPlay installation declined."
+    yes_no "Close this prefix's Wine apps and install native DirectPlay now (Voobly lobbies need it)?" y ||
+        die "DirectPlay installation declined. Rerun with --no-directplay to skip it deliberately."
     install_winetricks
     aoe_stop_wine
     if yes_no "Back up the Wine prefix first? (optional, can be large)" n; then
@@ -1235,6 +1335,7 @@ Commands
   aoe2-voobly aoe2        start the game launcher directly (does not force a patch)
   aoe2-voobly clear-port  free TCP/UDP $PORT
   aoe2-voobly port-test   port state before/after stopping this prefix's Wine
+  aoe2-voobly port-diag   who holds $PORT (TCP/UDP), the game's UDP range, DirectPlay
   aoe2-voobly stop        stop all Wine processes of this prefix
   aoe2-voobly desktop-size  show the desktop Wine would use, without starting it
   aoe2-voobly mount-game / umount-game   (root mode) mount or unmount the game folder
@@ -1245,6 +1346,8 @@ Desktop
     auto       measured from Termux:X11 at every launch (needs xorg-xrandr)
     WIDTHxHEIGHT  fixed size for the shared "aoe2-termux" virtual desktop
     none       leave Wine's own desktop selection alone
+  Renderer: Direct3D=gdi (set at every launch; without it the game window stays black)
+  Re-apply it by hand:  aoe2-voobly d3d-gdi
   Change it without reinstalling anything:
     bash $0 --refresh-launchers-only --res auto|WIDTHxHEIGHT|none
 
@@ -1260,7 +1363,9 @@ What has and has not been verified with this setup
     the patched versions, which failed from /sdcard.
   - NOT verified: the root bind-mount mode. It depends on your Android version, root
     manager and SELinux, and the script falls back to the copy option when its own checks fail.
-  - Not verified: native DirectPlay (off by default), and that stopping Wine frees $PORT. Test:
+  - Native DirectPlay is installed by default because Voobly lobbies need it (skip it with
+    --no-directplay). It is not confirmed on this stack, and neither is the claim that
+    stopping Wine frees $PORT. Test:
       1. aoe2-voobly voobly, pick the patch (try v1.5 first, then v1.6 RC), launch from a lobby
       2. after leaving the lobby: aoe2-voobly port-test
          (busy -> available = cleanup verified; available -> available = nothing was stuck)
@@ -1284,7 +1389,7 @@ show_help() {
         printf '%s\n' \
             "Usage: bash install.sh [--game DIR] [--game-mode copy|root|keep]" \
             "                       [--voobly-setup FILE] [--prefix DIR] [--res auto|WxH|none]" \
-            "                       [--refresh-launchers-only] [--directplay]" \
+            "                       [--refresh-launchers-only] [--no-directplay]" \
             "                       [--reset-prefix] [--reinstall-hangover] [--yes]" \
             "Run the downloaded file directly for the full description."
     fi
@@ -1306,7 +1411,8 @@ parse_args() {
                                              die "--res must be auto, WIDTHxHEIGHT (e.g. 1280x720) or none" ;;
                                   esac ;;
             --refresh-launchers-only) REFRESH_ONLY=1; shift ;;
-            --directplay)         WANT_DIRECTPLAY=1; shift ;;
+            --directplay)         WANT_DIRECTPLAY=1; NO_DIRECTPLAY=0; DP_CLI=1; shift ;;
+            --no-directplay)      WANT_DIRECTPLAY=0; NO_DIRECTPLAY=1; DP_CLI=1; shift ;;
             --reset-prefix)       RESET_PREFIX=1; shift ;;
             --reinstall-hangover) REINSTALL_HANGOVER=1; shift ;;
             --yes|-y)             ASSUME_YES=1; shift ;;
@@ -1325,6 +1431,15 @@ main() {
     [ -r "$STATE" ] && . "$STATE"
     [ -n "$cli_res" ] && AOE_RES=$cli_res
     [ -n "${AOE_RES:-}" ] || AOE_RES=none
+    # Native DirectPlay is the default. --directplay/--no-directplay win for this run;
+    # otherwise a previous --no-directplay is honoured so the opt-out sticks.
+    if [ "$DP_CLI" != 1 ]; then
+        if [ "${AOE_NO_DIRECTPLAY:-0}" = 1 ]; then
+            WANT_DIRECTPLAY=0; NO_DIRECTPLAY=1
+        else
+            WANT_DIRECTPLAY=1; NO_DIRECTPLAY=0
+        fi
+    fi
     if [ "$REFRESH_ONLY" = 1 ]; then
         # Update the runtime + launcher only: no packages, no prefix, no game copy,
         # no DirectPlay, no Voobly install, no final smoke test.
@@ -1333,6 +1448,7 @@ main() {
         save_state
         say "Saved desktop mode AOE_RES=$AOE_RES (measured at each launch when 'auto')."
         ok "Launchers and runtime updated; no installation stages were run."
+        say "Prefix settings (virtual desktop, Direct3D=gdi) are applied by the next launch."
         exit 0
     fi
     trap 'printf "\nCancelled. Completed stages are skipped on the next run.\n"; exit 130' INT
