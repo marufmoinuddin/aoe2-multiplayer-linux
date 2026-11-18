@@ -17,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/marufmoinuddin/aoe2-multiplayer-lin
 **Android / Termux** (after installing the [Termux:X11](https://github.com/termux/termux-x11/releases) app):
 
 ```bash
-pkg install -y curl && curl -fsSL https://raw.githubusercontent.com/marufmoinuddin/aoe2-multiplayer-linux/main/termux/install_aoe2_voobly_termux.sh | bash
+pkg update && pkg upgrade -y && pkg install -y curl && curl -fsSL https://raw.githubusercontent.com/marufmoinuddin/aoe2-multiplayer-linux/main/termux/install_aoe2_voobly_termux.sh | bash
 ```
 
 Both are interactive and resumable; prompts work even though the script arrives via a pipe.
