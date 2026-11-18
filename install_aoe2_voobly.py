@@ -93,6 +93,7 @@ DIRECTPLAY_FILES = ('dplayx.dll', 'dpnet.dll', 'dpnhpast.dll', 'dpwsockx.dll')
 DIRECTX_REDIST_NAME = 'directx_feb2010_redist.exe'
 DIRECTX_REDIST_SHA256 = 'f6d191e89a963d7cca34f169d30f49eab99c1ed3bb92da73ec43617caaa1e93f'
 DIRECTX_REDIST_MIRRORS = (
+    'https://proxy.usebottles.com/redistributable/dependencies/directx_feb2010_redist.exe',
     'https://files.holarse-linuxgaming.de/mirrors/microsoft/directx_feb2010_redist.exe',
     'https://web.archive.org/web/20100205000000id_/https://download.microsoft.com/download/E/E/1/EE17FF74-6C45-4575-9CF4-7FC2597ACD18/directx_feb2010_redist.exe',
     'https://web.archive.org/web/20101224202650id_/http://download.microsoft.com/download/E/E/1/EE17FF74-6C45-4575-9CF4-7FC2597ACD18/directx_feb2010_redist.exe',

@@ -117,9 +117,9 @@ Local checkout: `bash termux/install_aoe2_voobly_termux.sh`.
 
 See `bash termux/install_aoe2_voobly_termux.sh --help` for the option list
 (game folder, game mode, prefix, resolution, DirectPlay) and the on-device
-steps. The installer is resumable: rerunning it skips completed stages. To set
-the window size pass `--res WIDTHxHEIGHT` (default `1280x720`) — see
-**Troubleshooting** below.
+steps. The installer is resumable: rerunning it skips completed stages. Windows
+are freely resizable by default; see **Troubleshooting** for the fixed-size
+`--res WxH` option. To remove the installation, see **Uninstalling → Termux**.
 
 ## Uninstalling
 
@@ -147,6 +147,25 @@ The uninstaller shows a full inventory (prefix, runner, `translator/box64`, laun
 
 Game directory backups (`<game dir>.backup-<timestamp>`) and any leftover `~/.local/share/aoe2-voobly` data from the previous layout are **kept by default** — confirm the extra prompts or pass `--purge-backups` / `--purge-legacy` to remove them. Re-running the installer afterwards starts from scratch.
 
+### Termux
+
+```bash
+bash termux/uninstall_aoe2_voobly_termux.sh                   # interactive
+bash termux/uninstall_aoe2_voobly_termux.sh --dry-run         # show what would be removed
+bash termux/uninstall_aoe2_voobly_termux.sh --purge-backups   # also remove game-dir backups
+```
+
+It shows an inventory first, stops the prefix's Wine processes and — in
+`--game-mode root` — unmounts the bind mount **before** deleting anything, then
+removes the Wine prefix, `~/.local/share/aoe2-fex/` and the
+`$PREFIX/bin/aoe2-voobly` command.
+
+**Never removed:** your game folder (including the `~/aoe2` copy made by
+`--game-mode copy`), the Voobly setup `.exe`, and the Termux packages
+(`hangover-wine`, `termux-x11-nightly`, `pulseaudio`, ...).
+
+Game-directory backups are kept unless you pass `--purge-backups`.
+
 ## Troubleshooting
 
 **Multiplayer drops back to the connection screen.** A stale DirectPlay helper is likely holding port **47624**. The launchers clear it automatically before starting; to do it manually:
@@ -161,28 +180,26 @@ Never kill *every* `dplaysvr.exe`, and don't change DirectPlay settings repeated
 
 **Wayland-only session.** Wine may need a working XWayland, or its Wayland driver configured.
 
-**Termux window is stuck at 1280×720.** The game and Voobly run inside a Wine
-*virtual desktop* whose size comes from `--res` (default `1280x720`) — resizing
-the Termux:X11 window does **not** resize it.
-
-If you have **already installed**, you do not need to rerun the installer. The
-saved value is re-read on every launch, so just edit it:
-
-```bash
-sed -i 's/^AOE_RES=.*/AOE_RES=1920x1080/' ~/.local/share/aoe2-fex/state.env
-```
-
-Or override it for a single run:
+**Termux window size.** By default the game and Voobly open in a **normal,
+freely resizable** window (`AOE_RES=none`) — resize it in Termux:X11 to any
+size you like. A fixed size is opt-in: `--res WxH` runs them inside a Wine
+*virtual desktop* (`/desktop=…,WxH`), which is why that window refuses to
+resize.
 
 ```bash
-AOE_RES=1920x1080 aoe2-voobly aoe2
+bash install.sh --res 1920x1080     # fixed 1920x1080 virtual desktop
+bash install.sh --res none          # free, resizable window (default)
 ```
 
-For a fresh install (or a rerun) pass the size to the installer instead:
+The saved value is re-read on every launch, so you can switch without rerunning:
 
 ```bash
-bash install.sh --res 1920x1080
+sed -i 's/^AOE_RES=.*/AOE_RES=none/' ~/.local/share/aoe2-fex/state.env
+AOE_RES=1920x1080 aoe2-voobly aoe2   # one run only
 ```
+
+Installs created by an older script always forced a virtual desktop; rerun once
+with `--res none` to regenerate the launcher before using `AOE_RES=none`.
 
 **Launcher and port 47624.** Launching always force-frees the port first: the
 launcher terminates whatever of yours is holding TCP/UDP 47624 (a leftover

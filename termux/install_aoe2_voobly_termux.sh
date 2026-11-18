@@ -15,7 +15,7 @@
 #
 #  Usage:
 #    bash aoe2-fex-voobly.sh [--game DIR] [--game-mode copy|root|keep]
-#                            [--voobly-setup FILE] [--prefix DIR] [--res WxH]
+#                            [--voobly-setup FILE] [--prefix DIR] [--res WxH|none]
 #                            [--directplay] [--reset-prefix] [--reinstall-hangover] [--yes]
 #
 #  Afterwards:  aoe2-voobly voobly | aoe2 | aok | clear-port | port-test |
@@ -119,7 +119,7 @@ save_state() {
     {
         printf 'HANGOVER_BIN=%q\n' "${HANGOVER_BIN:-}"
         printf 'AOE_PREFIX=%q\n'   "${AOE_PREFIX:-}"
-        printf 'AOE_RES=%q\n'      "${AOE_RES:-1280x720}"
+        printf 'AOE_RES=%q\n'      "${AOE_RES:-none}"
         printf 'GAME_DIR=%q\n'     "${GAME_DIR:-}"
         printf 'GAME_MODE=%q\n'    "${GAME_MODE:-keep}"
         printf 'GAME_ORIG=%q\n'    "${GAME_ORIG:-}"
@@ -168,11 +168,21 @@ bounded() {
 # (HODLL), Wine's built-in graphics DLLs are used (no DXVK), software GL is
 # requested (llvmpipe), and anything left over from older Box64/Mobox/Turnip
 # experiments is unset.
+# AOE_RES=none (default) opens a normal, freely resizable Wine window, so the
+# game can run at whatever size Termux:X11 gives it. AOE_RES=WxH opts into a
+# Wine virtual desktop pinned to exactly that size.
+aoe_desktop_arg() {   # aoe_desktop_arg NAME -> one explorer arg, or nothing
+    case "${AOE_RES:-none}" in
+        none|off|windowed|"") return 0 ;;
+        *) printf '/desktop=%s,%s' "$1" "$AOE_RES" ;;
+    esac
+}
+
 hf_env() {
     local want_res=${AOE_RES:-}
     [ -r "$AOE_STATE" ] && . "$AOE_STATE"
     [ -n "$want_res" ] && AOE_RES=$want_res
-    AOE_RES=${AOE_RES:-1280x720}
+    AOE_RES=${AOE_RES:-none}
     HANGOVER_BIN="${HANGOVER_BIN:-$PREFIX/opt/hangover-wine/bin}"
     if [ ! -x "$HANGOVER_BIN/wine" ]; then
         aoe_warn "Hangover Wine not found in $HANGOVER_BIN (pkg install x11-repo hangover-wine hangover-libwow64fex)."
@@ -459,12 +469,13 @@ launch() {   # launch LABEL WORKDIR wine-args...
 # The game launcher lives in a subfolder but loads DLLs from the game root, so it is
 # started from <drive>:\ (Windows working directory) via cmd's `start /wait`.
 game_launch() {   # game_launch LABEL REL_EXE [args...]
-    local label=$1 rel=$2 relw win cmdline; shift 2
+    local label=$1 rel=$2 relw win cmdline da; shift 2
     [ -f "$GAME_DIR/$rel" ] || { aoe_warn "Missing executable: $GAME_DIR/$rel  (rerun the installer)"; exit 1; }
     relw=${rel//\//\\}
     win="$GAME_PATH\\$relw"
     cmdline="cd /d $GAME_PATH\\ && start \"\" /wait $win${*:+ $*}"
-    launch "$label" "$GAME_DIR" explorer "/desktop=aoe2fex,$AOE_RES" 'C:\windows\system32\cmd.exe' /d /c "$cmdline"
+    da=$(aoe_desktop_arg aoe2fex)
+    launch "$label" "$GAME_DIR" explorer ${da:+"$da"} 'C:\windows\system32\cmd.exe' /d /c "$cmdline"
 }
 
 cmd=${1:-help}; [ $# -gt 0 ] && shift
@@ -477,7 +488,8 @@ esac
 case "$cmd" in
     voobly)
         [ -f "${VOOBLY_EXE:-}" ] || { aoe_warn "Voobly is not installed (rerun the installer)."; exit 1; }
-        launch voobly "$(dirname "$VOOBLY_EXE")" explorer "/desktop=voobly,$AOE_RES" "$(win_of "$VOOBLY_EXE")" "$@" ;;
+        da=$(aoe_desktop_arg voobly)
+        launch voobly "$(dirname "$VOOBLY_EXE")" explorer ${da:+"$da"} "$(win_of "$VOOBLY_EXE")" "$@" ;;
     aoe2|aoc)     game_launch aoe2 "$AOC_REL" "$@" ;;
     aok)          game_launch aok "$AOK_REL" "$@" ;;
     mount-game)
@@ -1023,7 +1035,8 @@ stage_voobly() {
             say "Running the Voobly installer (attempt $attempt/2) ..."
             : >"$ilog"
             if [ -n "$win" ]; then
-                ( cd "$stagedir" && hwine explorer "/desktop=voobly-setup,$AOE_RES" "$win" ) >>"$ilog" 2>&1; rc=$?
+                local darg; darg=$(aoe_desktop_arg voobly-setup)
+                ( cd "$stagedir" && hwine explorer ${darg:+"$darg"} "$win" ) >>"$ilog" 2>&1; rc=$?
             else
                 ( cd "$stagedir" && hwine "$staged" ) >>"$ilog" 2>&1; rc=$?
             fi
@@ -1109,8 +1122,10 @@ What has and has not been verified with this setup
       1. aoe2-voobly voobly, pick the patch (try v1.5 first, then v1.6 RC), launch from a lobby
       2. after leaving the lobby: aoe2-voobly port-test
          (busy -> available = cleanup verified; available -> available = nothing was stuck)
-  - Graphics use Wine's built-in DLLs in a virtual desktop ($AOE_RES) with software GL requested
-    (llvmpipe); it is not confirmed that software GL alone is what makes it work.
+  - Graphics use Wine's built-in DLLs with software GL requested (llvmpipe); it is
+    not confirmed that software GL alone is what makes it work.
+  - AOE_RES=none (default) opens a normal window you can resize to any size;
+    --res WxH pins a fixed-size Wine virtual desktop instead.
   - Let Voobly launch the game for lobby tests; do not start 'aoe2-voobly aoe2' alongside it.
   - Keep Termux awake (the launcher takes a wake lock) and disable battery optimisation for
     Termux and Termux:X11, otherwise Android may kill them mid-match.
@@ -1126,7 +1141,7 @@ show_help() {
     else
         printf '%s\n' \
             "Usage: bash install.sh [--game DIR] [--game-mode copy|root|keep]" \
-            "                       [--voobly-setup FILE] [--prefix DIR] [--res WxH]" \
+            "                       [--voobly-setup FILE] [--prefix DIR] [--res WxH|none]" \
             "                       [--directplay] [--reset-prefix] [--reinstall-hangover] [--yes]" \
             "Run the downloaded file directly for the full description."
     fi
@@ -1140,8 +1155,12 @@ parse_args() {
                                   case "$GAME_MODE_ARG" in copy|root|keep) ;; *) die "--game-mode must be copy, root or keep" ;; esac ;;
             --voobly-setup)       [ $# -ge 2 ] || die "--voobly-setup needs a file"; SETUP_ARG=$2; shift 2 ;;
             --prefix)             [ $# -ge 2 ] || die "--prefix needs a directory"; PREFIX_ARG=$2; shift 2 ;;
-            --res)                [ $# -ge 2 ] || die "--res needs WIDTHxHEIGHT"; AOE_RES=$2; shift 2
-                                  [[ "$AOE_RES" =~ ^[0-9]+x[0-9]+$ ]] || die "--res must look like 1280x720" ;;
+            --res)                [ $# -ge 2 ] || die "--res needs WIDTHxHEIGHT or none"; AOE_RES=$2; shift 2
+                                  case "$AOE_RES" in
+                                      none|off|windowed) AOE_RES=none ;;
+                                      *) [[ "$AOE_RES" =~ ^[0-9]+x[0-9]+$ ]] ||
+                                             die "--res must be WIDTHxHEIGHT (e.g. 1280x720) or none" ;;
+                                  esac ;;
             --directplay)         WANT_DIRECTPLAY=1; shift ;;
             --reset-prefix)       RESET_PREFIX=1; shift ;;
             --reinstall-hangover) REINSTALL_HANGOVER=1; shift ;;
@@ -1160,7 +1179,7 @@ main() {
     local cli_res=${AOE_RES:-}
     [ -r "$STATE" ] && . "$STATE"
     [ -n "$cli_res" ] && AOE_RES=$cli_res
-    [ -n "${AOE_RES:-}" ] || AOE_RES=1280x720
+    [ -n "${AOE_RES:-}" ] || AOE_RES=none
     trap 'printf "\nCancelled. Completed stages are skipped on the next run.\n"; exit 130' INT
     printf '%s\n' "Age of Empires II  x  Voobly  ->  Hangover Wine + FEX (Termux)"
     stage_preflight
