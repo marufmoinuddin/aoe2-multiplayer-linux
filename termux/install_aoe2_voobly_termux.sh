@@ -5,18 +5,21 @@
 #  1. Installs Termux's packaged `hangover-wine` + `hangover-libwow64fex`
 #     (Wine ARM64; 32-bit Windows code runs through FEX via HODLL=libwow64fex.dll).
 #  2. Creates a Wine prefix and checks that 32-bit Windows programs start.
-#  3. Maps your AoE II folder as a Wine drive (symlink in dosdevices, no copy).
+#  3. Maps your AoE II folder as a Wine drive (symlink in dosdevices). If the folder
+#     is outside Termux's private storage (e.g. /sdcard, mounted noexec by Android)
+#     you choose: a ROOT bind mount of the raw storage path, or a COPY into ~/aoe2.
 #  4. (optional, --directplay) installs native DirectPlay via winetricks.
 #  5. Installs Voobly (installer is staged in a private folder first).
-#  6. Creates the `aoe2-voobly` command. Every launch first frees TCP/UDP 47624.
+#  6. Creates the `aoe2-voobly` command. Every launch first frees TCP/UDP 47624
+#     (and, in root mode, re-creates the bind mount if a reboot removed it).
 #
 #  Usage:
-#    bash aoe2-fex-voobly.sh [--game DIR] [--voobly-setup FILE] [--prefix DIR]
-#                            [--res WxH] [--directplay] [--reset-prefix]
-#                            [--reinstall-hangover] [--yes]
+#    bash aoe2-fex-voobly.sh [--game DIR] [--game-mode copy|root|keep]
+#                            [--voobly-setup FILE] [--prefix DIR] [--res WxH]
+#                            [--directplay] [--reset-prefix] [--reinstall-hangover] [--yes]
 #
 #  Afterwards:  aoe2-voobly voobly | aoe2 | aok | clear-port | port-test |
-#                           stop | status | wine ARGS...
+#                           stop | status | mount-game | umount-game | wine ARGS...
 #
 #  Wine is not a sandbox. Use only game files and installers you trust.
 # =============================================================================
@@ -46,7 +49,7 @@ DIRECTX_MIRRORS=(
     'https://web.archive.org/web/2016id_/https://download.microsoft.com/download/E/E/1/EE17FF74-6C45-4575-9CF4-7FC2597ACD18/directx_feb2010_redist.exe'
 )
 
-GAME_DIR_ARG=""; SETUP_ARG=""; PREFIX_ARG=""; ASSUME_YES=0
+GAME_DIR_ARG=""; GAME_MODE_ARG=""; SETUP_ARG=""; PREFIX_ARG=""; ASSUME_YES=0
 WANT_DIRECTPLAY=0; REINSTALL_HANGOVER=0; RESET_PREFIX=0
 C_ON=""; { [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; } && C_ON=1
 
@@ -118,6 +121,9 @@ save_state() {
         printf 'AOE_PREFIX=%q\n'   "${AOE_PREFIX:-}"
         printf 'AOE_RES=%q\n'      "${AOE_RES:-1280x720}"
         printf 'GAME_DIR=%q\n'     "${GAME_DIR:-}"
+        printf 'GAME_MODE=%q\n'    "${GAME_MODE:-keep}"
+        printf 'GAME_ORIG=%q\n'    "${GAME_ORIG:-}"
+        printf 'GAME_SRC=%q\n'     "${GAME_SRC:-}"
         printf 'GAME_DRIVE=%q\n'   "${GAME_DRIVE:-}"
         printf 'GAME_PATH=%q\n'    "${GAME_PATH:-}"
         printf 'AOK_REL=%q\n'      "${AOK_REL:-}"
@@ -128,8 +134,8 @@ save_state() {
 
 # =============================================================================
 #  Shared runtime (written to $LIB/env.sh, sourced by the installer AND by the
-#  launcher, so there is one implementation of "run Hangover's Wine" and of
-#  "free port 47624").
+#  launcher, so there is one implementation of "run Hangover's Wine", of
+#  "free port 47624" and of "mount the game folder with root").
 # =============================================================================
 write_env_lib() {
     cat >"$LIB/env.sh.tmp" <<'ENVSH'
@@ -327,6 +333,65 @@ aoe_audio() {
             --load="module-native-protocol-tcp auth-ip-acl=127.0.0.1 auth-anonymous=1" >/dev/null 2>&1
     export PULSE_SERVER="${PULSE_SERVER:-127.0.0.1}"
 }
+
+# ------------------------------------------- root bind mount (root game mode) ---
+# Android mounts /sdcard (a FUSE layer) noexec, so Wine cannot map game executables
+# there. In root mode the RAW storage path (/data/media/0/...) is bind-mounted onto a
+# folder in Termux's private storage. The mount is lost on reboot, so the launcher
+# calls aoe_game_ensure before every start.
+AOE_SU_OPT=""
+AOE_SU_PROBED=""
+
+aoe_have_su() { command -v su >/dev/null 2>&1; }
+
+# Pick the su flag that puts the mount in the global namespace (visible to Termux).
+aoe_su_detect() {
+    [ -n "$AOE_SU_PROBED" ] && return 0
+    AOE_SU_PROBED=1
+    if bounded 60 su --mount-master -c true >/dev/null 2>&1; then AOE_SU_OPT=--mount-master
+    elif bounded 60 su -M -c true >/dev/null 2>&1; then AOE_SU_OPT=-M
+    fi
+    return 0
+}
+
+# aoe_root CMD ARGS... : run one command as root with every argument safely quoted.
+aoe_root() {
+    local cmd="" a
+    aoe_su_detect
+    for a in "$@"; do cmd+="${cmd:+ }$(printf '%q' "$a")"; done
+    # shellcheck disable=SC2086
+    su $AOE_SU_OPT -c "$cmd"
+}
+
+aoe_game_mounted() { mount 2>/dev/null | grep -qF " on $1 type "; }
+
+aoe_bind_mount() {   # aoe_bind_mount SRC DST
+    local src=$1 dst=$2
+    aoe_game_mounted "$dst" && return 0
+    mkdir -p "$dst" || return 1
+    aoe_root mount --bind "$src" "$dst" || return 1
+    # Best effort: a bind mount can inherit ro/noexec from its source.
+    aoe_root mount -o remount,bind,rw,exec "$dst" >/dev/null 2>&1 || true
+    aoe_game_mounted "$dst"
+}
+
+aoe_bind_umount() {  # aoe_bind_umount DST
+    aoe_game_mounted "$1" || return 0
+    aoe_root umount "$1" || aoe_root umount -l "$1"
+}
+
+# Called before every launch: re-creates the bind mount after a reboot.
+aoe_game_ensure() {
+    [ "${GAME_MODE:-keep}" = bind ] || return 0
+    aoe_game_mounted "$GAME_DIR" && return 0
+    aoe_say "Mounting the game folder with root: $GAME_SRC -> $GAME_DIR"
+    if ! aoe_have_su; then aoe_warn "No 'su' command: cannot mount the game folder."; return 1; fi
+    if ! aoe_bind_mount "$GAME_SRC" "$GAME_DIR"; then
+        aoe_warn "Could not mount the game folder. Grant root to Termux, or rerun the installer with --game-mode copy."
+        return 1
+    fi
+    aoe_say "Mounted."
+}
 ENVSH
     mv "$LIB/env.sh.tmp" "$LIB/env.sh"
 }
@@ -354,6 +419,8 @@ Usage: aoe2-voobly <command> [game arguments]
   port-test    check $PORT, stop this prefix's Wine, check again
   stop         stop every Wine process of this prefix
   status       show drive link, port and running processes
+  mount-game   (root mode) bind-mount the game folder now
+  umount-game  (root mode) stop Wine and unmount the game folder
   wine ARGS    run Hangover's wine with this prefix (e.g. wine winecfg)
 EOF
 }
@@ -401,12 +468,26 @@ game_launch() {   # game_launch LABEL REL_EXE [args...]
 }
 
 cmd=${1:-help}; [ $# -gt 0 ] && shift
+
+# Root mode: the bind mount is lost on reboot, so make sure it is there first.
+case "$cmd" in
+    voobly|aoe2|aoc|aok|mount-game) aoe_game_ensure || exit 1 ;;
+esac
+
 case "$cmd" in
     voobly)
         [ -f "${VOOBLY_EXE:-}" ] || { aoe_warn "Voobly is not installed (rerun the installer)."; exit 1; }
         launch voobly "$(dirname "$VOOBLY_EXE")" explorer "/desktop=voobly,$AOE_RES" "$(win_of "$VOOBLY_EXE")" "$@" ;;
     aoe2|aoc)     game_launch aoe2 "$AOC_REL" "$@" ;;
     aok)          game_launch aok "$AOK_REL" "$@" ;;
+    mount-game)
+        if [ "${GAME_MODE:-keep}" = bind ]; then aoe_say "Game folder is mounted: $GAME_DIR"
+        else aoe_say "Game mode is '${GAME_MODE:-keep}': nothing to mount."; fi ;;
+    umount-game)
+        if [ "${GAME_MODE:-keep}" = bind ]; then
+            aoe_stop_wine
+            aoe_bind_umount "$GAME_DIR" && aoe_say "Unmounted $GAME_DIR."
+        else aoe_say "Game mode is '${GAME_MODE:-keep}': nothing to unmount."; fi ;;
     clear-port)   aoe_port_clear ;;
     port-test)
         port_busy && b=busy || b=available
@@ -424,6 +505,12 @@ case "$cmd" in
         aoe_say "Prefix    : $WINEPREFIX"
         aoe_say "Wine      : $("$HANGOVER_BIN/wine" --version 2>/dev/null)"
         aoe_say "Game      : ${GAME_DIR:-?}  ->  ${GAME_PATH:-?}"
+        case "${GAME_MODE:-keep}" in
+            bind) aoe_game_mounted "$GAME_DIR" && m=mounted || m="NOT mounted (starts automatically)"
+                  aoe_say "Game mode : root bind mount of ${GAME_SRC:-?} ($m)" ;;
+            copy) aoe_say "Game mode : copy in Termux storage (original: ${GAME_ORIG:-?})" ;;
+            *)    aoe_say "Game mode : in place" ;;
+        esac
         aoe_say "Voobly    : ${VOOBLY_EXE:-not installed}"
         if port_busy; then aoe_say "Port $PORT : IN USE ($(port_pids | tr '\n' ' ')owner may be hidden by Android)"
         else aoe_say "Port $PORT : free"; fi
@@ -465,7 +552,7 @@ stage_preflight() {
     fi
     command -v curl >/dev/null 2>&1 || die "curl is required."
     command -v python3 >/dev/null 2>&1 ||
-        warn "python3 not installed: port checks fall back to lsof/TCP probing (pkg install python makes them exact)."
+        warn "python3 not installed: port checks and the executable-storage test are less exact (pkg install python)."
     ok "Termux, ARM64 and storage access look fine."
 }
 
@@ -541,6 +628,11 @@ pick_drive() {   # echo free-or-existing drive letter pointing at $GAME_DIR
         link="$dev/$l:"
         if [ -L "$link" ] && [ "$(readlink -f "$link")" = "$game" ]; then echo "$l"; return 0; fi
     done
+    # The game moved (e.g. /sdcard -> copy or bind mount): keep the drive letter this
+    # script created earlier so Voobly's saved G:\ paths stay valid.
+    if [ -n "${GAME_DRIVE:-}" ] && [ -L "$dev/${GAME_DRIVE}:" ]; then
+        ln -sfn "$game" "$dev/${GAME_DRIVE}:" && { echo "$GAME_DRIVE"; return 0; }
+    fi
     for l in g h i j k l m n o p q r s t u v w x y; do
         link="$dev/$l:"
         if [ ! -e "$link" ] && [ ! -L "$link" ]; then
@@ -560,10 +652,185 @@ drive_visible() {   # drive_visible "G:"  - can Wine cd to the root of that driv
     return 1
 }
 
+# ------------------------------------------ where does the game folder live? ---
+# Android mounts shared storage (/sdcard) noexec through FUSE. Wine then cannot map the
+# game's exe/DLL sections as executable, and patched executables (UserPatch 1.5/1.6)
+# can fail to start even though the plain 1.0c game runs. Two ways around it:
+#   root : bind-mount the raw storage path (/data/media/0/...) into Termux's home
+#   copy : copy the folder into Termux's private storage (~/aoe2)
+
+in_private_storage() {   # 0 when the path is inside Termux's own (exec-capable) storage
+    local p=$1 home_real
+    home_real="$(readlink -f "$HOME" 2>/dev/null)"; home_real=${home_real:-$HOME}
+    case "$p/" in
+        "$HOME"/*|"$home_real"/*|"$PREFIX"/*) return 0 ;;
+        /data/data/com.termux/*|/data/user/*/com.termux/*) return 0 ;;
+    esac
+    return 1
+}
+
+exec_mappable() {   # exec_mappable FILE: 0 = can be mapped executable, 1 = cannot, 2 = unknown
+    command -v python3 >/dev/null 2>&1 || return 2
+    python3 -c 'import mmap, sys
+f = open(sys.argv[1], "rb")
+mmap.mmap(f.fileno(), 0, flags=mmap.MAP_PRIVATE, prot=mmap.PROT_READ | mmap.PROT_EXEC)' "$1" 2>/dev/null
+}
+
+raw_media_path() {   # map an Android storage path to the underlying (non-FUSE) path
+    local p=$1
+    case "$p" in
+        /storage/emulated/*)       printf '/data/media/%s' "${p#/storage/emulated/}" ;;
+        /storage/self/primary/*)   printf '/data/media/0/%s' "${p#/storage/self/primary/}" ;;
+        /sdcard/*)                 printf '/data/media/0/%s' "${p#/sdcard/}" ;;
+        /storage/????-????/*)      local rest=${p#/storage/}; printf '/mnt/media_rw/%s' "$rest" ;;
+        *)                         printf '%s' "$p" ;;
+    esac
+}
+
+location_root() {   # try the root bind mount; 0 = success (sets GAME_DIR/GAME_SRC/GAME_ORIG/GAME_MODE)
+    local raw mp line bad=""
+    aoe_have_su || { warn "No 'su' command: this device does not look rooted."; return 1; }
+    say "Requesting root: grant the prompt in your root manager ..."
+    aoe_su_detect
+    # shellcheck disable=SC2086
+    bounded 60 su $AOE_SU_OPT -c id 2>/dev/null | grep -q 'uid=0' ||
+        { warn "Root access was not granted to Termux."; return 1; }
+
+    raw="$(raw_media_path "$GAME_DIR")"
+    aoe_root test -d "$raw" || { warn "Root cannot see $raw (is the game on internal storage?)."; return 1; }
+    mp="$BASE/game"
+    aoe_stop_wine >/dev/null 2>&1
+    aoe_bind_umount "$mp" >/dev/null 2>&1
+    say "Bind-mounting $raw  ->  $mp"
+    if ! aoe_bind_mount "$raw" "$mp"; then
+        warn "The bind mount failed, or it is not visible from Termux."
+        aoe_bind_umount "$mp" >/dev/null 2>&1
+        return 1
+    fi
+
+    line="$(mount 2>/dev/null | grep -F " on $mp type " | tail -n1)"
+    printf 'game mount: %s\n' "$line" >>"$LOG"
+    say "  $line"
+    case "$line" in *" type fuse"*|*" type sdcardfs"*|*" type esdfs"*) bad="still a FUSE/sdcardfs mount" ;; esac
+    case "$line" in *noexec*) bad="${bad:+$bad; }mounted noexec" ;; esac
+    case "$line" in *"(ro,"*|*"(ro)"*) bad="${bad:+$bad; }mounted read-only" ;; esac
+    if [ -n "$bad" ]; then
+        warn "The mount does not help: $bad."
+        aoe_bind_umount "$mp" >/dev/null 2>&1
+        return 1
+    fi
+
+    if [ ! -r "$mp/$AOC_REL" ]; then
+        warn "Mounted, but Termux cannot read the files (SELinux or file ownership)."
+        if yes_no "Run 'setenforce 0' (SELinux permissive until reboot; weakens Android security)?" n &&
+           aoe_root setenforce 0 && [ -r "$mp/$AOC_REL" ]; then
+            ok "Readable now (SELinux is permissive until the next reboot)."
+        else
+            aoe_bind_umount "$mp" >/dev/null 2>&1
+            return 1
+        fi
+    fi
+
+    exec_mappable "$mp/$AOC_REL"
+    case $? in
+        1) warn "Files there still cannot be mapped executable."; aoe_bind_umount "$mp" >/dev/null 2>&1; return 1 ;;
+        2) warn "python3 missing: could not test executable mapping; continuing." ;;
+    esac
+
+    GAME_ORIG=$GAME_DIR; GAME_SRC=$raw; GAME_DIR=$mp; GAME_MODE=bind
+    ok "Root mode: $raw is mounted at $mp (the launcher remounts it after a reboot)."
+    return 0
+}
+
+location_copy() {   # copy the game into Termux storage; 0 = success
+    local src=$GAME_DIR dest need free
+    ask "Copy the game folder to" "$HOME/aoe2"; dest=$(clean_path "$REPLY")
+    case "$dest/" in "$src"/*) warn "The copy cannot be inside the original folder."; return 1 ;; esac
+    case "$src/" in "$dest"/*) warn "The copy cannot contain the original folder."; return 1 ;; esac
+    case "$dest/" in "$WINEPREFIX"/*) warn "The copy cannot be inside the Wine prefix."; return 1 ;; esac
+    in_private_storage "$dest" || warn "$dest is not in Termux's private storage; executables may not work there."
+
+    if [ -n "$(find_ci "$dest" age2_x1.exe 3)" ] || [ -n "$(find_ci "$dest" age2x1.exe 3)" ]; then
+        if yes_no "A game copy already exists in $dest. Use it as it is (no copying)?" y; then
+            GAME_ORIG=$src; GAME_SRC=""; GAME_DIR=$dest; GAME_MODE=copy
+            ok "Using the existing copy: $dest"
+            return 0
+        fi
+    elif [ -d "$dest" ] && [ -n "$(ls -A "$dest" 2>/dev/null)" ]; then
+        yes_no "$dest is not empty. Copy into it anyway (existing files are overwritten)?" n || return 1
+    fi
+
+    mkdir -p "$dest" || { warn "Cannot create $dest."; return 1; }
+    need=$(du -sk "$src" 2>/dev/null | cut -f1)
+    free=$(df -Pk "$dest" 2>/dev/null | awk 'NR==2{print $4}')
+    if [ -n "$need" ] && [ -n "$free" ] && [ "$free" -lt $((need + 262144)) ]; then
+        warn "Not enough free space: need about $((need / 1024)) MB plus 256 MB spare, have $((free / 1024)) MB."
+        return 1
+    fi
+    say "Copying $src  ->  $dest  (this can take a while) ..."
+    cp -a "$src/." "$dest/" 2>>"$LOG" || { warn "Copy failed; see the log."; return 1; }
+    [ -f "$dest/$AOC_REL" ] || { warn "Copy finished but $AOC_REL is missing in $dest."; return 1; }
+    GAME_ORIG=$src; GAME_SRC=""; GAME_DIR=$dest; GAME_MODE=copy
+    ok "Copied. The original stays untouched as your backup: $src"
+    return 0
+}
+
+prepare_game_location() {
+    local prev_mode=${GAME_MODE:-keep} prev_orig=${GAME_ORIG:-} choice rc
+    GAME_MODE=keep; GAME_ORIG=""; GAME_SRC=""
+
+    if in_private_storage "$GAME_DIR"; then
+        [ "$prev_mode" = copy ] && { GAME_MODE=copy; GAME_ORIG=$prev_orig; }
+        ok "The game folder is in Termux's private storage; executables map fine there."
+        return 0
+    fi
+
+    exec_mappable "$GAME_DIR/$AOC_REL"; rc=$?
+    if [ "$rc" = 0 ]; then
+        ok "Executables in $GAME_DIR can be mapped executable; using the folder in place."
+        return 0
+    fi
+
+    warn "The game folder is outside Termux's private storage: $GAME_DIR"
+    say "  Android mounts shared storage (/sdcard) noexec. Wine then cannot map the game's"
+    say "  executables there, and the patched 1.5/1.6 versions may refuse to start."
+    choice="$GAME_MODE_ARG"
+    if [ -z "$choice" ]; then
+        say ""
+        say "  1) Root: bind-mount the raw storage path into Termux's home (experimental)."
+        say "     The game stays on /sdcard (survives clearing Termux data). Needs root;"
+        say "     the mount is lost on reboot and the launcher redoes it automatically."
+        say "  2) Copy: copy the game folder to ~/aoe2 (reliable, uses extra space)."
+        say "     Your /sdcard copy stays untouched as a backup. Updates made by Voobly"
+        say "     only go into the copy."
+        ask "Choose 1 or 2" "2"
+        case "$REPLY" in 1|root|r) choice=root ;; *) choice=copy ;; esac
+    fi
+
+    case "$choice" in
+        keep)
+            warn "Keeping the folder in place (--game-mode keep); UserPatch 1.5/1.6 may not start."
+            ;;
+        root)
+            if ! location_root; then
+                warn "The root option did not work on this device."
+                yes_no "Copy the game to the Termux home folder instead?" y ||
+                    die "Cancelled. Rerun with --game-mode copy, or move the game into Termux's home."
+                location_copy || die "Copying the game failed; see the messages above and the log."
+            fi
+            ;;
+        copy)
+            location_copy || die "Copying the game failed; see the messages above and the log."
+            ;;
+    esac
+}
+
 stage_game() {
     stage 4 "Map the AoE II game folder as a Wine drive"
     local default d aok aoc
     default="${GAME_DIR:-$HOME/storage/shared/Games/Age of Empires II}"
+    # Remembered root/copy setups: offer the ORIGINAL folder again, not the mount/copy.
+    case "${GAME_MODE:-keep}" in bind|copy) [ -n "${GAME_ORIG:-}" ] && default=$GAME_ORIG ;; esac
     if [ -n "$GAME_DIR_ARG" ]; then d=$(clean_path "$GAME_DIR_ARG")
     else
         say "Folder with the ORIGINAL AoE II + The Conquerors (age2_x1.exe) files."
@@ -587,6 +854,10 @@ stage_game() {
         die "Expected the original 32-bit game executables (not HD/Definitive Edition)."
     AOK_REL="${aok#"$GAME_DIR"/}"; AOC_REL="${aoc#"$GAME_DIR"/}"
 
+    # Outside Termux's private storage? Offer the root bind mount or a copy.
+    prepare_game_location
+    save_state
+
     local letter drive attempt visible=0
     letter="$(pick_drive)" || die "No free Wine drive letter (g: to y:)."
     drive="${letter^^}:"
@@ -603,10 +874,13 @@ stage_game() {
     ok "$drive  ->  $GAME_DIR"
     say "Launcher: ${GAME_PATH}\\${AOC_REL//\//\\}   (started with $GAME_PATH\\ as working directory)"
 
-    if yes_no "Back up the game folder before Voobly can patch it? (optional, needs free space)" n; then
+    # A copy already has the untouched original as its backup.
+    if [ "$GAME_MODE" != copy ] &&
+       yes_no "Back up the game folder before Voobly can patch it? (optional, needs free space)" n; then
         local need free target="$GAME_DIR.backup-$STAMP"
+        [ "$GAME_MODE" = bind ] && target="$GAME_ORIG.backup-$STAMP"
         need=$(du -sk "$GAME_DIR" 2>/dev/null | cut -f1)
-        free=$(df -Pk "$(dirname "$GAME_DIR")" 2>/dev/null | awk 'NR==2{print $4}')
+        free=$(df -Pk "$HOME" 2>/dev/null | awk 'NR==2{print $4}')
         if [ -n "$need" ] && [ -n "$free" ] && [ "$free" -gt $((need + 524288)) ]; then
             cp -a "$GAME_DIR" "$target" && ok "Backup: $target"
         else
@@ -781,15 +1055,21 @@ stage_final() {
         "$BIN/aoe2-voobly" voobly
     fi
 
-    local gp="${GAME_PATH:-${GAME_DRIVE^^}:}" aoc_dir="" inst_dir
+    local gp="${GAME_PATH:-${GAME_DRIVE^^}:}" aoc_dir="" inst_dir mode_line
     case "$AOC_REL" in */*) aoc_dir="${AOC_REL%/*}" ;; esac
     inst_dir="$gp"; [ -n "$aoc_dir" ] && inst_dir="$gp\\${aoc_dir//\//\\}"
+    case "${GAME_MODE:-keep}" in
+        bind) mode_line="root bind mount of $GAME_SRC (original path: $GAME_ORIG)" ;;
+        copy) mode_line="copy in Termux storage (original untouched: $GAME_ORIG)" ;;
+        *)    mode_line="in place" ;;
+    esac
     cat <<EOF
 
 $(_c '1;32')INSTALLATION PREPARED$(_c 0)
   Prefix    : $WINEPREFIX
   Wine      : $HANGOVER_BIN  (HODLL=libwow64fex.dll)
   Game      : $GAME_DIR  ->  $gp
+  Game mode : $mode_line
   Voobly    : $VOOBLY_EXE
   Log       : $LOG
 
@@ -799,6 +1079,7 @@ Commands
   aoe2-voobly clear-port  free TCP/UDP $PORT
   aoe2-voobly port-test   port state before/after stopping this prefix's Wine
   aoe2-voobly stop        stop all Wine processes of this prefix
+  aoe2-voobly mount-game / umount-game   (root mode) mount or unmount the game folder
   aoe2-voobly status
 
 In Voobly (Game Diagnostics / settings)
@@ -809,8 +1090,11 @@ In Voobly (Game Diagnostics / settings)
 What has and has not been verified with this setup
   - Verified: packaged Hangover + FEX starts 32-bit programs, AoE II reaches its launcher,
     Voobly installs and its client opens.
-  - Not verified: a Voobly lobby launching the correct patch, native DirectPlay (off by
-    default), and that stopping Wine frees $PORT. Test with:
+  - Verified (by a user report): a copy of the game inside Termux's home lets Voobly start
+    the patched versions, which failed from /sdcard.
+  - NOT verified: the root bind-mount mode. It depends on your Android version, root
+    manager and SELinux, and the script falls back to the copy option when its own checks fail.
+  - Not verified: native DirectPlay (off by default), and that stopping Wine frees $PORT. Test:
       1. aoe2-voobly voobly, pick the patch (try v1.5 first, then v1.6 RC), launch from a lobby
       2. after leaving the lobby: aoe2-voobly port-test
          (busy -> available = cleanup verified; available -> available = nothing was stuck)
@@ -826,6 +1110,8 @@ parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --game)               [ $# -ge 2 ] || die "--game needs a directory"; GAME_DIR_ARG=$2; shift 2 ;;
+            --game-mode)          [ $# -ge 2 ] || die "--game-mode needs copy, root or keep"; GAME_MODE_ARG=$2; shift 2
+                                  case "$GAME_MODE_ARG" in copy|root|keep) ;; *) die "--game-mode must be copy, root or keep" ;; esac ;;
             --voobly-setup)       [ $# -ge 2 ] || die "--voobly-setup needs a file"; SETUP_ARG=$2; shift 2 ;;
             --prefix)             [ $# -ge 2 ] || die "--prefix needs a directory"; PREFIX_ARG=$2; shift 2 ;;
             --res)                [ $# -ge 2 ] || die "--res needs WIDTHxHEIGHT"; AOE_RES=$2; shift 2
@@ -834,7 +1120,7 @@ parse_args() {
             --reset-prefix)       RESET_PREFIX=1; shift ;;
             --reinstall-hangover) REINSTALL_HANGOVER=1; shift ;;
             --yes|-y)             ASSUME_YES=1; shift ;;
-            -h|--help)            sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+            -h|--help)            sed -n '3,/^# =====/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
             *) die "Unknown option: $1" ;;
         esac
     done
